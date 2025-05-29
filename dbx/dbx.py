@@ -11,6 +11,8 @@ from typing import Union, Optional
 
 import tqdm
 
+import numpy as np
+
 import fsspec
 
 from scipy.stats import qmc
@@ -30,6 +32,8 @@ class Logger:
         verbose: bool = False,
         debug: bool = False,
         select: bool = False,
+        name: Optional[str] = None,
+        stack_depth: int = 2,
     ):
         self.allowed = []
         if warning:
@@ -42,10 +46,14 @@ class Logger:
             self.allowed.append("VERBOSE")
         if select:
             self.allowed.append("SELECT")
+        self.stack_depth = stack_depth
+        self.name = name
+        if self.name is None:
+            self.name = f"{inspect.stack()[stack_depth].function}"
 
-    def _print(self, prefix, msg, *, stack_depth=2):
+    def _print(self, prefix, msg):
         if prefix in self.allowed:
-            print(f"{prefix}: {inspect.stack()[stack_depth].function}: {msg}")
+            print(f"{prefix}: {self.name}: {msg}")
 
     def warning(self, msg):
         self._print("WARNING", msg)
@@ -223,6 +231,7 @@ class Datablock:
         self.log = Logger(
             debug=debug,
             verbose=verbose,
+            name=self.anchor(),
         )
 
         self.cfg = cfg
@@ -233,6 +242,7 @@ class Datablock:
         self.config = self._inject_cfg(self.cfg)
         self.unmoored = unmoored
         self.tag = None
+
         self.__post_init__()
 
 
@@ -296,7 +306,7 @@ class Datablock:
         if overwrite or not self.valid():
             self.__pre_build__(tag).__build__().__post_build__(tag)
         else:
-            self.log.info(f"Skipping existing datablock: {self.dirpath()}")
+            self.log.verbose(f"Skipping existing datablock: {self.dirpath()}")
         return self
 
     def __pre_build__(self, tag: str = None):
@@ -359,7 +369,6 @@ class Datablock:
             self.__module__
             + "."
             + self.__class__.__name__
-            + "/#"
         )
         return anchor
     
@@ -367,6 +376,7 @@ class Datablock:
         anchorpath = os.path.join(
             self.root,
             self.anchor(),
+            '#',
         )
         return anchorpath
     
