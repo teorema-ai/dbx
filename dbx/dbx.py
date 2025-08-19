@@ -1,13 +1,15 @@
 from collections.abc import Iterable
-from dataclasses import dataclass, fields, asdict
+from dataclasses import dataclass, fields, asdict, replace
 import datetime
 import hashlib
 import importlib
 import inspect
 import json
 import os
+import sys
 import typing
 from typing import Union, Optional
+import uuid
 
 import tqdm
 
@@ -81,58 +83,94 @@ def make_download_url(path):
     return f"https://storage.cloud.google.com/{_path}"
 
 
-def get_named_term(name):
-    def get_named_const_and_cxt(name):
-        bits = name.split(".")
-        modbits = bits[:-1]
-        prefix = None
-        ctx = {}
-        for modbit in modbits:
-            if prefix is not None:
-                modname = prefix + "." + modbit
-            else:
-                modname = modbit
-            mod = importlib.import_module(modname)
-            ctx[modname] = mod
-            prefix = modname
-        constname = bits[-1]
-        const = getattr(mod, constname)
-        return const, ctx
+def get_named_const_and_cxt(name):
+    bits = name.split(".")
+    modbits = bits[:-1]
+    prefix = None
+    cxt = {}
+    for modbit in modbits:
+        if prefix is not None:
+            modname = prefix + "." + modbit
+        else:
+            modname = modbit
+        mod = importlib.import_module(modname)
+        prefix = modname
+        cxt[modname] = mod
+    constname = bits[-1]
+    const = getattr(mod, constname)
+    return const, cxt
 
-    def get_named_funcstr_and_argkwargstr(name):
+
+def eval_term(name):
+    def get_named_args_kwargs(argkwargstr):
+        args = []
+        kwargs = {}
+        if len(argkwargstr) > 0:
+            bits = argkwargstr.split(",")
+            for bit in bits:
+                if "=" in bit:
+                    k, v = bit.split("=")
+                    val = eval_term(v)
+                    kwargs[k] = val
+                else:
+                    arg = eval_term(bit)
+                    args.append(arg)
+        return args, kwargs
+
+    def get_named_func_args_kwargs(name):
         # TODO: replace with a regex
         lb = name.find("(")
-        rb = name.find(")")
+        rb = name.rfind(")")
         if lb == -1 or rb == -1:
             lb = name.find("[")
             rb = name.find("]")
         if lb == -1 or rb == -1:
-            funcstr = None
-            argkwargstr = None
+            func = None
+            args = None
+            kwargs = None
         else:
             funcstr = name[:lb]
+            func, _ = get_named_const_and_cxt(funcstr)
             argkwargstr = name[lb + 1 : rb]
-        return funcstr, argkwargstr
+            args, kwargs = get_named_args_kwargs(argkwargstr)
+        return func, args, kwargs
 
     if isinstance(name, Iterable) and not isinstance(name, str):
-        term = [get_named_term(item) for item in name]
+        term = [eval_term(item) for item in name]
     elif isinstance(name, str):
-        if not name.startswith("[") or not name.endswith("]") or not name.startswith("@"):
+        if not (name.startswith("[") and name.endswith("]")) and not name.startswith("@"):
             term = name
         else:
             if name.startswith("@"):
                 _name_ = name[1:]
             else:
                 _name_ = name[1:-1]
-            funcstr, argkwargstr = get_named_funcstr_and_argkwargstr(_name_)
-            if funcstr is None:
+            func, args, kwargs = get_named_func_args_kwargs(_name_)
+            if func is None:
                 term, _ = get_named_const_and_cxt(_name_)
             else:
-                _, ctx = get_named_const_and_cxt(funcstr)
-                term = eval(f"{funcstr}({argkwargstr})", globals(), ctx)
+                term = func(*args, **kwargs)
     else:
         term = name
     return term
+
+
+def exec(s=None):
+    if s is None:
+        if len(sys.argv) > 2:
+            raise ValueError(f"Too many args: {sys.argv}")
+        elif len(sys.argv) == 1:
+            raise ValueError(f"Too few args: {sys.argv}")
+        s = sys.argv[1]
+    lb = s.find("(")
+    rb = s.rfind(")")
+    _, cxt = get_named_const_and_cxt(s[:lb])
+    r = eval(s, globals(), cxt)
+    return r
+
+
+def exec_print(argstr=None):
+    print(exec(argstr))
 
 
 def write_json(data, path, *, log=Logger(), debug: bool = False):
@@ -148,6 +186,22 @@ def read_json(path, *, log=Logger(), debug: bool = False):
         data = json.load(f)
         log.info(f"READ {path}")
     return data
+
+
+def write_tensor(tensor, path, *, log=Logger(), debug: bool = False):
+    fs, _ = fsspec.url_to_fs(path)
+    array = tensor.numpy()
+    with fs.open(path, "wb") as f:
+        np.save(f, array)
+        log.info(f"WROTE {path}")
+
+def read_tensor(path, *, log=Logger(), debug: bool = False):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, "rb") as f:
+        array = np.load(f)
+        log.info(f"READ {path}")
+        tensor = torch.from_numpy(array)
+    return tensor
 
 
 class IntRange(tuple):
@@ -205,8 +259,15 @@ def make_halton_sampling_kwargs_sequence(N, range_kwargs, *, seed=123, precision
 
 class Datablock:
     """
-    TOPICS = {'topic', 'file.csv'} | TOPIC = 'file.csv'
-    ROOT = None
+    ROOT = 'protocol://path/to/root'
+    FILES = {'topic', 'file.csv'} | FILE = 'file.csv'
+    # protocol://path --- module/class/# --- topic --- file 
+    #        root           [anchor]        [topic]   [file]
+    # root:       'protocol://path/to/root'
+    # anchorpath: '{root}/modpath/class/#'|'{root}' if not unmoored|else
+    # dirpath:    '{anchorpath}/topic'|{anchorpath}' if topic is not None|else
+    # path:       '{dirpath}/{FILE}'|'{dirpath}' if FILE is not None|else
+    
     """
     @dataclass
     class CONFIG:
@@ -219,16 +280,24 @@ class Datablock:
         debug: bool = False,
         version: str  = None,
         *,
-        cfg: Optional[Union[str,dict]] = None,
+        cfg: Optional[Union[str, dict]] = None,
         hash: Optional[str] = None,
         unmoored: bool = False,
     ):
         self.root = root
         if self.root is None:
-            if hasattr(self, 'ROOT'):
-                self.root = self.ROOT
-            else:
-                self.root = os.environ.get('DATALAKE')
+            self.root = os.environ.get('DATASPACE')
+            if self.root is None:
+                mod = importlib.import_module(self.__module__)
+                if hasattr(mod, 'DATASPACE'):
+                    self.root = getattr(
+                    mod,
+                    'DATASPACE',
+                )
+            if self.root is None:
+                if hasattr(self, 'ROOT'):
+                    self.root = self.ROOT
+                
         self.verbose = verbose
         self.debug = debug
         self.version = version
@@ -254,6 +323,12 @@ class Datablock:
     def __post_init__(self):
         ...
 
+    @property
+    def uuid(self):
+        if not hasattr(self, '_uuid'):
+            self._uuid = str(uuid.uuid4())
+        return self._uuid
+
     def kwargs(self):
         return dict(
             root=self.root,
@@ -267,19 +342,17 @@ class Datablock:
         self,
         topic=None,
         *,
-        ensure: bool = False,
+        ensure_dirpath: bool = False,
     ):
         if topic is None:
-            path_ = os.path.join(
-                self.dirpath(),
-            )
-            topicfile = self.TOPIC
+            dirpath = self.dirpath()
+            topicfile = self.FILE
         else:
-            path_ = self.dirpath(topic)
-            topicfile = self.TOPICS[topic]
-        path = os.path.join(path_, topicfile) if topicfile is not None else path_  
-        if ensure:
-            self.ensure_path(path)      
+            dirpath = self.dirpath(topic)
+            topicfile = self.FILES[topic]
+        path = os.path.join(dirpath, topicfile) if topicfile is not None else dirpath
+        if ensure_dirpath:
+            self.ensure_path(dirpath)      
         return path
 
     def ensure_path(self, path):
@@ -308,10 +381,10 @@ class Datablock:
 
         results = []
 
-        if hasattr(self, "TOPICS"):
+        if hasattr(self, "FILES"):
             results += [
                 validpath(self.path(topic))
-                for topic in self.TOPICS
+                for topic in self.FILES
             ]
         else:
             results += [validpath(self.path())]
@@ -342,8 +415,8 @@ class Datablock:
         return self
 
     def leave_breadcrumbs(self):
-        if hasattr(self, "TOPICS"):
-            for topic in self.TOPICS:
+        if hasattr(self, "FILES"):
+            for topic in self.FILES:
                 self.dirpath(topic, ensure=True)
                 self._leave_breadcrumbs_at_path(self.path(topic))
         else:
@@ -382,8 +455,8 @@ class Datablock:
                 self.log.warning(f"EXCEPTION: {e}")
                 if throw:
                     raise (e)
-        if hasattr(self, "TOPICS"):
-            for topic in self.TOPICS:
+        if hasattr(self, "FILES"):
+            for topic in self.FILES:
                 clear_dirpath(self.dirpath(topic))
         else:
             clear_dirpath(self.dirpath())
@@ -434,10 +507,14 @@ class Datablock:
         fs, _ = fsspec.url_to_fs(scopeanchorpath)
         paths = list(fs.ls(scopeanchorpath))
         hashes = [f.removeprefix(scopeanchorpath).removeprefix('/') for f in paths]
-        cfgfiles = [os.path.join(path, 'config.parquet') for path in paths]
-        ds = pq.ParquetDataset(cfgfiles, filesystem=fs)
-        df = ds.read().to_pandas()
-        df.index = hashes
+        cfgfiles_ = [os.path.join(path, 'cfg.parquet') for path in paths]
+        cfgfiles = [f for f in cfgfiles_ if fs.exists(f)]
+        if len(cfgfiles) > 0:
+            ds = pq.ParquetDataset(cfgfiles, filesystem=fs)
+            df = ds.read().to_pandas()
+            df.index = hashes
+        else:
+            df = pd.DataFrame(index=hashes)
         verfiles = [os.path.join(path, 'version') for path in paths]
         versions = []
         for verfile in verfiles:
@@ -456,8 +533,12 @@ class Datablock:
     def Journal(cls, root):
         journaldirpath = cls._journalanchorpath(root)
         fs, _ = fsspec.url_to_fs(journaldirpath)
-        ds = pq.ParquetDataset(list(fs.ls(journaldirpath)), filesystem=fs)
-        df = ds.read().to_pandas().sort_values('datetime', ascending=False)
+        files = list(fs.ls(journaldirpath))
+        if len(files) > 0:
+            ds = pq.ParquetDataset(files, filesystem=fs)
+            df = ds.read().to_pandas().sort_values('datetime', ascending=False)
+        else:
+            df = pd.DataFrame()
         return df
 
     def scopes(self):
@@ -540,7 +621,7 @@ class Datablock:
         else:
             anchorpath = self.anchorpath()
             if topic is not None:
-                assert topic in self.TOPICS, f"Topic {topic} not in {self.TOPICS}"
+                assert topic in self.FILES, f"Topic {repr(topic)} not in {self.FILES}"
                 dirpath = os.path.join(anchorpath, self.hash(), topic)
             else:
                 dirpath = os.path.join(anchorpath, self.hash())
@@ -554,28 +635,39 @@ class Datablock:
         vfs, _ = fsspec.url_to_fs(versionpath)
         with vfs.open(versionpath, 'w') as vf:
             vf.write(str(self.version))
+        assert vfs.exists(versionpath), f"Versionpath {versionpath} does not exist after writing"
         #
         jconfigpath = self.Cfgpath(self.root, self.hash(), 'json')
         jcfs, _ = fsspec.url_to_fs(jconfigpath)
         with jcfs.open(jconfigpath, 'w') as jcf:
             json.dump(self.cfg, jcf)
+        assert jcfs.exists(jconfigpath), f"Configpath {jconfigpath} does not exist after writing"
+        #
         pconfigpath = self.Cfgpath(self.root, self.hash(), 'parquet')
+        pcfs, _ = fsspec.url_to_fs(pconfigpath)
         cfgdf = pd.DataFrame.from_records([self.cfg])
         cfgdf.to_parquet(pconfigpath)
+        assert pcfs.exists(pconfigpath), f"Configpath {pconfigpath} does not exist after writing"
+        #
         self.log.verbose(f"wrote SCOPE: versionpath: {versionpath} and configpaths: {jconfigpath} and {pconfigpath}")
     
     def _write_journal_entry(self, event:str, tag:str=None):
         hash = self.hash()
         dt = str(datetime.datetime.now()).replace(' ', '-')
         path = os.path.join(self._journalanchorpath(self.root), f"{hash}-{dt}.parquet")
-        df = pd.DataFrame.from_records([{'hash': hash, 'version': self.version, 'event': event, 'tag': tag, 'datetime': dt}])
+        df = pd.DataFrame.from_records([{'hash': hash, 'uuid': self.uuid, 'version': self.version, 'event': event, 'tag': tag, 'datetime': dt}])
         self.log.verbose(f"Wrote JOURNAL entry for event {repr(event)} with tag {repr(tag)} to path {path}")
         df.to_parquet(path)
     
     def _inject_cfg(self, cfg):
         config = self.CONFIG(**cfg)
+        replacements = {}
         for field in fields(config):
-            setattr(self, field.name, get_named_term(getattr(config, field.name)))
+            term = getattr(config, field.name)
+            obj = eval_term(term)
+            setattr(self, field.name, obj)
+            replacements[field.name] = obj
+        config = replace(config, **replacements)
         return config
 
     def _leave_breadcrumbs_at_path(self, path):
@@ -584,9 +676,28 @@ class Datablock:
             f.write("")
 
 
-def datablock_build(
-    *,
+def datablock_method(
     datablock_cls,
+    method_name,
+    *,
+    root: str = None,
+    verbose: bool = False,
+    debug: bool = False,
+    version: str  = None,
+    cfg: dict,
+    hash: Optional[str] = None,
+    unmoored: bool = False,
+    **kwargs,
+):
+    datablock_cls = eval_term(datablock_cls)
+    datablock = datablock_cls(root=root, verbose=verbose, debug=debug, version=version, cfg=cfg, hash=hash, unmoored=unmoored)
+    method = getattr(datablock, method_name)
+    return method(**kwargs)
+
+#TODO: factor through datablock_method
+def datablock_build(
+    datablock_cls,
+    *,
     root: str = None,
     verbose: bool = False,
     debug: bool = False,
@@ -594,12 +705,11 @@ def datablock_build(
     tag: str  = None,
     cfg: dict,
 ):
-    datablock_cls = get_named_term(datablock_cls)
+    datablock_cls = eval_term(datablock_cls)
     datablock = datablock_cls(root=root, verbose=verbose, debug=debug, version=version, cfg=cfg)
     return datablock.build(tag)
 
 
-TAG = str
 class BatchRunner:
     @property
     def tag(self):
@@ -611,7 +721,7 @@ class BatchRunner:
 
 class Databatch(Datablock):
     DATABLOCK = None
-    TOPIC = "summary.csv"
+    FILE = "summary.csv"
 
     def __init__(
         self,
@@ -630,7 +740,7 @@ class Databatch(Datablock):
         raise NotImplementedError()
         return self
 
-    def submit(self):
+    def submit(self, tag: str = None):
         if self.runner is None:
             n_datablocks = len(self.datablocks())
             if self.verbose or self.debug:
@@ -653,7 +763,7 @@ class Databatch(Datablock):
         return self
 
     def __build__(self):
-        return self.submit()
+        return self.submit(tag=self.tag)
 
     def datablock_scopes(self):
         return self.Scopes(self.DATABLOCK, self.root)
