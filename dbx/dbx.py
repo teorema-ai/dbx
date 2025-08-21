@@ -11,6 +11,8 @@ import typing
 from typing import Union, Optional
 import uuid
 
+import git
+
 import tqdm
 
 import numpy as np
@@ -74,6 +76,20 @@ class Logger:
 
     def silent(self, mst):
         pass
+
+
+def gitrevision(repopath, *, log=Logger()):
+    if repopath is not None:
+        repo = git.Repo(repopath)
+        log.verbose(f"Obtaining git revision for git repo {repopath}")
+        if repo.is_dirty():
+            raise ValueError(f"Dirty git repo: {repopath}: commit your changes")
+        branch = repo.active_branch.name
+        reponame = os.path.basename(repopath)
+        revision = f"{reponame}:{repo.rev_parse(branch).hexsha}"
+    else:
+        revision = None
+    return revision
 
 
 def make_download_url(path):
@@ -278,7 +294,7 @@ class Datablock:
         root: str = None,
         verbose: bool = False,
         debug: bool = False,
-        version: str  = None,
+        gitrepo: str  = None,
         *,
         cfg: Optional[Union[str, dict]] = None,
         hash: Optional[str] = None,
@@ -286,13 +302,13 @@ class Datablock:
     ):
         self.root = root
         if self.root is None:
-            self.root = os.environ.get('DATASPACE')
+            self.root = os.environ.get('DBKSPACE')
             if self.root is None:
                 mod = importlib.import_module(self.__module__)
-                if hasattr(mod, 'DATASPACE'):
+                if hasattr(mod, 'DBKSPACE'):
                     self.root = getattr(
                     mod,
-                    'DATASPACE',
+                    'DBKSPACE',
                 )
             if self.root is None:
                 if hasattr(self, 'ROOT'):
@@ -300,12 +316,20 @@ class Datablock:
                 
         self.verbose = verbose
         self.debug = debug
-        self.version = version
         self.log = Logger(
             debug=debug,
             verbose=verbose,
             name=self.anchor(),
         )
+        self.gitrepo = gitrepo
+        if self.gitrepo is None:
+                mod = importlib.import_module(self.__module__)
+                if hasattr(mod, 'DBKREPO'):
+                    self.gitrepo = getattr(
+                    mod,
+                    'DBKREPO',
+                )
+        self.version = gitrevision(self.gitrepo, log=self.log) if self.gitrepo is not None else None
 
         self.cfg = cfg
         if isinstance(cfg, str):
