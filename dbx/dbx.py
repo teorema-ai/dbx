@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import sys
+import traceback as tb
 import typing
 from typing import Union, Optional
 import uuid
@@ -23,6 +24,7 @@ from scipy.stats import qmc
 
 import pandas as pd
 import pyarrow.parquet as pq
+import torch
 
 
 class Logger:
@@ -81,12 +83,12 @@ class Logger:
 def gitrevision(repopath, *, log=Logger()):
     if repopath is not None:
         repo = git.Repo(repopath)
-        log.verbose(f"Obtaining git revision for git repo {repopath}")
         if repo.is_dirty():
             raise ValueError(f"Dirty git repo: {repopath}: commit your changes")
         branch = repo.active_branch.name
         reponame = os.path.basename(repopath)
         revision = f"{reponame}:{repo.rev_parse(branch).hexsha}"
+        log.verbose(f"Obtained git revision for git repo {repopath}: {revision}")
     else:
         revision = None
     return revision
@@ -287,7 +289,20 @@ class Datablock:
     """
     @dataclass
     class CONFIG:
-        ...
+        class LazyGetter:
+            def __init__(self, term):
+                self.term = term
+                self.value = None
+            def __call__(self):
+                if self.value is None:
+                    self.value = eval_term(self.term)
+                return self.value
+
+        def __getattribute__(self, name):
+            attr = super().__getattribute__(name)
+            if isinstance(attr, Datablock.CONFIG.LazyGetter):
+                return attr()
+            return attr
 
     def __init__(
         self,
@@ -329,8 +344,6 @@ class Datablock:
                     mod,
                     'DBKREPO',
                 )
-        self.version = gitrevision(self.gitrepo, log=self.log) if self.gitrepo is not None else None
-
         self.cfg = cfg
         if isinstance(cfg, str):
             self.cfg = read_json(cfg, debug=debug)
@@ -358,7 +371,6 @@ class Datablock:
             root=self.root,
             verbose=self.verbose,
             debug=self.debug,
-            version=self.version,
             cfg=self.cfg,
         )
 
@@ -413,18 +425,19 @@ class Datablock:
         else:
             results += [validpath(self.path())]
         result = all(results)
+        self.log.debug(f"{results=}")
         return result
 
-    def build(self, tag:str = None, *, overwrite: bool = False):
-        if overwrite or not self.valid():
+    def build(self, tag:str = None):
+        if not self.valid():
             self.__pre_build__(tag).__build__().__post_build__(tag)
         else:
             self.log.verbose(f"Skipping existing datablock: {self.dirpath()}")
         return self
 
     def __pre_build__(self, tag: str = None):
-        self._write_scope()
-        self._write_journal_entry(event="build:start", tag=tag)
+        self._write_scope(version=self.version)
+        self._write_journal_entry(event="build:start", tag=tag, version=self.version)
         self.tag = tag
         return self
 
@@ -435,8 +448,15 @@ class Datablock:
         if tag is not None:
             assert tag == self.tag, f"Tag mismatch: {tag=} != {self.tag=}"
         self.tag = None
-        self._write_journal_entry(event="build:end", tag=tag)
+        self._write_journal_entry(event="build:end", tag=tag, version=self.version)
         return self
+    
+    @property
+    def version(self):
+        if not hasattr(self, '_version'):
+            self._version = gitrevision(self.gitrepo, log=self.log) if self.gitrepo is not None else None
+        return self._version
+
 
     def leave_breadcrumbs(self):
         if hasattr(self, "FILES"):
@@ -454,7 +474,7 @@ class Datablock:
     
     def UNSAFE_clear(self):
         def clear_dirpath(dirpath, *, throw=False):
-            self.log.info(f"removing {dirpath} to overwrite output")
+            self.log.info(f"removing {dirpath}")
             try:
                 if dirpath.startswith("gs://"):
                     """
@@ -484,7 +504,7 @@ class Datablock:
                 clear_dirpath(self.dirpath(topic))
         else:
             clear_dirpath(self.dirpath())
-        self._write_journal_entry(event="UNSAFE_clear")
+        self._write_journal_entry(event="UNSAFE_clear", version=self.version)
         return self
     
     def anchor(self):
@@ -654,11 +674,11 @@ class Datablock:
             fs.makedirs(dirpath, exist_ok=True)
         return dirpath
 
-    def _write_scope(self):
+    def _write_scope(self, *, version):
         versionpath = self.Versionpath(self.root, self.hash())
         vfs, _ = fsspec.url_to_fs(versionpath)
         with vfs.open(versionpath, 'w') as vf:
-            vf.write(str(self.version))
+            vf.write(str(version))
         assert vfs.exists(versionpath), f"Versionpath {versionpath} does not exist after writing"
         #
         jconfigpath = self.Cfgpath(self.root, self.hash(), 'json')
@@ -675,11 +695,11 @@ class Datablock:
         #
         self.log.verbose(f"wrote SCOPE: versionpath: {versionpath} and configpaths: {jconfigpath} and {pconfigpath}")
     
-    def _write_journal_entry(self, event:str, tag:str=None):
+    def _write_journal_entry(self, event:str, tag:str=None, *, version):
         hash = self.hash()
         dt = str(datetime.datetime.now()).replace(' ', '-')
         path = os.path.join(self._journalanchorpath(self.root), f"{hash}-{dt}.parquet")
-        df = pd.DataFrame.from_records([{'hash': hash, 'uuid': self.uuid, 'version': self.version, 'event': event, 'tag': tag, 'datetime': dt}])
+        df = pd.DataFrame.from_records([{'hash': hash, 'uuid': self.uuid, 'version': version, 'event': event, 'tag': tag, 'datetime': dt}])
         self.log.verbose(f"Wrote JOURNAL entry for event {repr(event)} with tag {repr(tag)} to path {path}")
         df.to_parquet(path)
     
@@ -688,9 +708,12 @@ class Datablock:
         replacements = {}
         for field in fields(config):
             term = getattr(config, field.name)
-            obj = eval_term(term)
-            setattr(self, field.name, obj)
-            replacements[field.name] = obj
+            if issubclass(self.CONFIG, Datablock.CONFIG):
+                getter = Datablock.CONFIG.LazyGetter(term)
+            else:
+                getter = eval_term(term)
+            setattr(self, field.name, getter)
+            replacements[field.name] = getter
         config = replace(config, **replacements)
         return config
 
@@ -707,7 +730,6 @@ def datablock_method(
     root: str = None,
     verbose: bool = False,
     debug: bool = False,
-    version: str  = None,
     cfg: dict,
     hash: Optional[str] = None,
     unmoored: bool = False,
@@ -725,7 +747,6 @@ def datablock_build(
     root: str = None,
     verbose: bool = False,
     debug: bool = False,
-    version: str  = None,
     tag: str  = None,
     cfg: dict,
 ):
@@ -752,19 +773,18 @@ class Databatch(Datablock):
         root: str = None,
         verbose: bool = False,
         debug: bool = False,
-        version: str  = None,
         runner: BatchRunner = None,
         *,
         cfg: Optional[Union[str,dict]] = None,
     ):
-        super().__init__(root, verbose, debug, version, cfg=cfg)
+        super().__init__(root, verbose, debug, cfg=cfg)
         self.runner = runner
 
     def datablocks(self) -> typing.Iterable[Datablock]:
         raise NotImplementedError()
         return self
 
-    def submit(self, tag: str = None):
+    def run(self, tag: str = None):
         if self.runner is None:
             n_datablocks = len(self.datablocks())
             if self.verbose or self.debug:
@@ -773,21 +793,31 @@ class Databatch(Datablock):
                 iterator = tqdm.tqdm(enumerate(self.datablocks()))
             for i, datablock in iterator:
                 self.log.verbose(f"Building {i}-th datablock out of {n_datablocks}")
-                datablock.build(tag=f"submit:{self.hash()}")
+                tagi = f"run:{i}:{self.hash()}"
+                if tag is not None:
+                    tagi = f"{tag}:{tagi}"
+                datablock.build(tag=tagi)
         else:
-            kwargslist = [
-                dict(
+            tag = tag or (self.runner.tag if hasattr(self.runner, 'tag') else None)
+            kwargslist = []
+            for i, datablock in enumerate(self.datablocks()):
+                tagi = f"run:{i}:{self.hash()}"
+                if tag is not None:
+                    tagi = f"{tag}:{tagi}"
+                kwargs = dict(
                     datablock_cls=self.DATABLOCK,
-                    tag=self.runner.tag,
+                    tag=tagi,
                     **datablock.kwargs(),
                 )
-                for datablock in self.datablocks()
-            ]
+                kwargslist.append(kwargs)
             self.runner(datablock_build, kwargslist)
         return self
 
     def __build__(self):
-        return self.submit(tag=self.tag)
+        return self.run(tag=self.tag)
+    
+    def submit(self, tag: str = None):
+        return self.run(tag=tag)
 
     def datablock_scopes(self):
         return self.Scopes(self.DATABLOCK, self.root)
