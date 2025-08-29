@@ -318,7 +318,30 @@ class Datablock:
         capture_build_output: bool = False,
         gitrepo: str  = None,
     ):
-        self.root = root
+        self.__setstate__(dict(
+            root=root,
+            verbose=verbose,
+            debug=debug,
+            cfg=cfg,
+            hash=hash,
+            unmoored=unmoored,
+            capture_build_output=capture_build_output,
+            gitrepo=gitrepo,
+        ))
+        
+    def __setstate__(
+        self,
+        kwargs,
+    ):
+        self.root = kwargs.get('root')
+        self.verbose = kwargs.get('verbose')
+        self.debug = kwargs.get('debug')
+        self.cfg = kwargs.get('cfg')
+        self._hash = kwargs.get('hash')
+        self.unmoored = kwargs.get('unmoored')
+        self.capture_build_output = kwargs.get('capture_build_output')
+        self.gitrepo = kwargs.get('gitrepo')
+
         if self.root is None:
             self.root = os.environ.get('DBKSPACE')
             if self.root is None:
@@ -332,15 +355,11 @@ class Datablock:
                 if hasattr(self, 'ROOT'):
                     self.root = self.ROOT
                 
-        self.verbose = verbose
-        self.debug = debug
         self.log = Logger(
-            debug=debug,
-            verbose=verbose,
+            debug=self.debug,
+            verbose=self.verbose,
             name=self.anchor(),
         )
-        self.capture_build_output = capture_build_output
-        self.gitrepo = gitrepo
         if self.gitrepo is None:
                 mod = importlib.import_module(self.__module__)
                 if hasattr(mod, 'DBKREPO'):
@@ -348,18 +367,18 @@ class Datablock:
                     mod,
                     'DBKREPO',
                 )
-        self.cfg = cfg
-        if isinstance(cfg, str):
-            self.cfg = read_json(cfg, debug=debug)
+        if isinstance(self.cfg, str):
+            self.cfg = read_json(self.cfg, debug=self.debug)
         if self.cfg is None:
             self.cfg = asdict(self.CONFIG())
         self.config = self._cfg_to_config(self.cfg)
-        self._hash = hash
-        self._autohash = hash is None
-        self.unmoored = unmoored
+        self._autohash = self._hash is None
         self.tag = None
-
         self.__post_init__()
+
+
+    def __getstate__(self):
+        return self.kwargs()
 
 
     def __post_init__(self):
@@ -377,7 +396,7 @@ class Datablock:
             verbose=self.verbose,
             debug=self.debug,
             cfg=self.cfg,
-            hash=self.hash,
+            hash=self._hash if not self._autohash else None,
             unmoored=self.unmoored,
             capture_build_output=self.capture_build_output,
             gitrepo=self.gitrepo,
@@ -771,6 +790,7 @@ class Datablock:
 def datablock_method(
     datablock_cls,
     method_name,
+    method_kwargs={},
     *,
     root: str = None,
     verbose: bool = False,
@@ -780,12 +800,11 @@ def datablock_method(
     unmoored: bool = False,
     capture_build_output: bool = False,
     gitrepo: str  = None,
-    **kwargs,
 ):
     datablock_cls = eval_term(datablock_cls)
     datablock = datablock_cls(root=root, verbose=verbose, debug=debug, cfg=cfg, hash=hash, unmoored=unmoored, capture_build_output=capture_build_output, gitrepo=gitrepo)
     method = getattr(datablock, method_name)
-    return method(**kwargs)
+    return method(**method_kwargs)
 
     
 class BatchRunner:
@@ -846,7 +865,7 @@ class Databatch(Datablock):
                 kwargs = dict(
                     datablock_cls=self.DATABLOCK,
                     method_name="build",
-                    tag=tagi,
+                    method_kwargs=dict(tag=tagi,),
                     **datablock.kwargs(),
                 )
                 kwargslist.append(kwargs)
