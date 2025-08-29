@@ -856,7 +856,7 @@ class Databatch(Datablock):
                     tagi = f"{tag}:{tagi}"
                 datablock.build(tag=tagi)
         else:
-            tag = self.tag or (self.buildr.tag if hasattr(self.builder, 'tag') else None)
+            tag = self.tag or (self.builder.tag if hasattr(self.builder, 'tag') else None)
             dataset_method_build_kwargslist = []
             for i, datablock in enumerate(self.datablocks()):
                 tagi = f"run:{i}:{self.hash}"
