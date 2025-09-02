@@ -286,7 +286,7 @@ class Datablock:
     """
     @dataclass
     class CONFIG:
-        class LazyAttribute:
+        class LazyLoader:
             def __init__(self, term):
                 self.term = term
                 self.value = None
@@ -297,7 +297,7 @@ class Datablock:
 
         def __getattribute__(self, name):
             attr = super().__getattribute__(name)
-            if isinstance(attr, Datablock.CONFIG.LazyAttribute):
+            if isinstance(attr, Datablock.CONFIG.LazyLoader):
                 return attr()
             return attr
 
@@ -378,6 +378,14 @@ class Datablock:
 
     def __post_init__(self):
         ...
+
+    @property
+    def version(self):
+        if hasattr(self, 'VERSION'):
+            version = self.VERSION
+        else:
+            version = None
+        return version
 
     def __repr__(self):
         argstr = ', '.join((repr(self.root), repr(self.spec)))
@@ -488,8 +496,8 @@ class Datablock:
         return self
 
     def __pre_build__(self, tag: str = None):
-        self._write_scope(version=self.version)
-        self._write_journal_entry(event="build:start", tag=tag, version=self.version)
+        self._write_scope()
+        self._write_journal_entry(event="build:start", tag=tag)
         self.tag = tag
         return self
 
@@ -500,14 +508,14 @@ class Datablock:
         if tag is not None:
             assert tag == self.tag, f"Tag mismatch: {tag=} != {self.tag=}"
         self.tag = None
-        self._write_journal_entry(event="build:end", tag=tag, version=self.version)
+        self._write_journal_entry(event="build:end", tag=tag)
         return self
     
     @property
-    def version(self):
-        if not hasattr(self, '_version'):
-            self._version = gitrevision(self.gitrepo, log=self.log) if self.gitrepo is not None else None
-        return self._version
+    def revision(self):
+        if not hasattr(self, '_revision'):
+            self._revision = gitrevision(self.gitrepo, log=self.log) if self.gitrepo is not None else None
+        return self._revision
 
 
     def leave_breadcrumbs(self):
@@ -562,7 +570,7 @@ class Datablock:
                 clear_dirpath(self.dirpath(topic))
         else:
             clear_dirpath(self.dirpath())
-        self._write_journal_entry(event="UNSAFE_clear", version=self.version)
+        self._write_journal_entry(event="UNSAFE_clear")
         return self
     
     def anchor(self):
@@ -584,6 +592,7 @@ class Datablock:
     def hash(self):
         if self._hash is None:
             hivehandle = os.path.join(
+                f"version={self.version}",
                 *[f"{key}={val}" for key, val in self.scopespec.items()]
             )
             sha = hashlib.sha256()
@@ -608,27 +617,18 @@ class Datablock:
         scopeanchorpath = cls._scopeanchorpath(root)
         fs, _ = fsspec.url_to_fs(scopeanchorpath)
         paths = list(fs.ls(scopeanchorpath))
-        hashes = [f.removeprefix(scopeanchorpath).removeprefix('/') for f in paths]
         specfiles_ = [os.path.join(path, 'cfg.parquet') for path in paths]
         specfiles = [f for f in specfiles_ if fs.exists(f)]
+        hashes = [os.path.dirname(f).removeprefix(scopeanchorpath).removeprefix('/') for f in specfiles]
         if len(specfiles) > 0:
-            ds = pq.ParquetDataset(specfiles, filesystem=fs)
-            df = ds.read().to_pandas()
+            dfs = []
+            for specfile in specfiles:
+                _df = pd.read_parquet(specfile)
+                dfs.append(_df)
+            df = pd.concat(dfs)
             df.index = hashes
         else:
             df = pd.DataFrame(index=hashes)
-        verfiles = [os.path.join(path, 'version') for path in paths]
-        versions = []
-        for verfile in verfiles:
-            #verfs = makefs(scopeanchorpath) # TODO: REMOVE
-            verfs, _ = fsspec.url_to_fs(scopeanchorpath)
-            with verfs.open(verfile, 'r') as verf:
-                version = verf.read()
-                versions.append(version)
-        df['version'] = versions
-        # The index is the dirpath to the file, ending in the hash, so we extract it and make a column
-        df['hash'] = [path.split('/')[-1] for path in df.index]
-        df = df.reset_index(drop=True)
         return df
 
     @staticmethod
@@ -636,11 +636,20 @@ class Datablock:
         journaldirpath = cls._journalanchorpath(root)
         fs, _ = fsspec.url_to_fs(journaldirpath)
         files = list(fs.ls(journaldirpath))
+        
         if len(files) > 0:
-            ds = pq.ParquetDataset(files, filesystem=fs)
-            df = ds.read().to_pandas().sort_values('datetime', ascending=False)
+            dfs = []
+            for file in files:
+                _df = pd.read_parquet(file)
+                if 'revision' not in _df.columns:
+                    _df = _df.rename(columns={'version': 'revision'})
+                dfs.append(_df)
+            df = pd.concat(dfs)
+            # TODO: FIX uuid; currently not unique
+            columns = ['hash', 'datetime'] + [c for c in df.columns if c not in ('hash', 'datetime', 'event', 'uuid')] + ['event']
+            df = df.sort_values('datetime', ascending=False)[columns].reset_index(drop=True)
         else:
-            df = pd.DataFrame()
+            df = pd.Dataframe()
         return df
 
     def scopes(self):
@@ -754,11 +763,11 @@ class Datablock:
             self._scopespec = scopespec
         return self._scopespec
 
-    def _write_scope(self, *, version):
+    def _write_scope(self):
         versionpath = self.Versionpath(self.root, self.hash)
         vfs, _ = fsspec.url_to_fs(versionpath)
         with vfs.open(versionpath, 'w') as vf:
-            vf.write(str(version))
+            vf.write(str(self.version))
         assert vfs.exists(versionpath), f"Versionpath {versionpath} does not exist after writing"
         #
         #
@@ -776,17 +785,19 @@ class Datablock:
         #
         self.log.verbose(f"wrote SCOPE: versionpath: {versionpath} and configpaths: {jconfigpath} and {pconfigpath}")
 
-    def _write_journal_entry(self, event:str, tag:str=None, *, version):
+    def _write_journal_entry(self, event:str, tag:str=None):
         hash = self.hash
         dt = str(datetime.datetime.now()).replace(' ', '-')
         path = os.path.join(self._journalanchorpath(self.root), f"{hash}-{dt}.parquet")
-        df = pd.DataFrame.from_records([{'hash': hash, 
+        df = pd.DataFrame.from_records([{'datetime': dt,
+                                         'version': self.version,
+                                         'revision': self.revision, 
+                                         'hash': hash,
+                                         'tag': tag,  
                                          'uuid': self.uuid, 
-                                         'version': version, 
-                                         'event': event, 
-                                         'tag': tag, 
-                                         'datetime': dt, 
-                                         'build_log': self.logpath()}])
+                                         'build_log': self.logpath(),
+                                         'event': event,
+        }])
         self.log.verbose(f"Wrote JOURNAL entry for event {repr(event)} with tag {repr(tag)} to path {path}")
         df.to_parquet(path)
     
@@ -796,7 +807,7 @@ class Datablock:
         for field in fields(config):
             term = getattr(config, field.name)
             if issubclass(self.CONFIG, Datablock.CONFIG):
-                getter = Datablock.CONFIG.LazyAttribute(term)
+                getter = Datablock.CONFIG.LazyLoader(term)
             else:
                 getter = eval_term(term)
             replacements[field.name] = getter
