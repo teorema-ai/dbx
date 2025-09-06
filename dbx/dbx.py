@@ -218,6 +218,22 @@ def read_tensor(path, *, log=Logger(), debug: bool = False):
     return tensor
 
 
+def write_npz(path, *, log=Logger(), debug: bool = False, **kwargs):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, "wb") as f:
+        np.savez(f, **kwargs)
+        log.info(f"WROTE {list(kwargs.keys())} to {path}")
+
+
+def read_npz(path, *keys, log=Logger(), debug: bool = False):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, "wb") as f:
+        data = np.load(f)
+        results = [data[k] for k in keys]
+        log.info(f"READ {list(keys)} from {path}")
+        return results
+
+
 class IntRange(tuple):
     # TODO: ought to be a dataclass, but then isinstance(x, IntRange) might fail
     pass
@@ -275,11 +291,11 @@ class Datablock:
     """
     ROOT = 'protocol://path/to/root'
     FILES = {'topic', 'file.csv'} | FILE = 'file.csv'
-    # protocol://path --- module/class/# --- topic --- file 
+    # protocol://path --- module/class/ --- topic --- file 
     #        root           [anchor]        [topic]   [file]
     # root:       'protocol://path/to/root'
     # anchorpath: '{root}/modpath/class'|'{root}' if anchored|else
-    # hashpath:   '{anchorpath}/#/{hash}|{anchorpath}/{hash}' if hash supplied through args|else
+    # hashpath:   '{anchorpath}/{hash}|{anchorpath}/{hash}' if hash supplied through args|else
     # dirpath:    '{hashpath}/topic'|{hashpath}' if topic is not None|else
     # path:       '{dirpath}/{FILE}'|'{dirpath}' if FILE is not None|else
     
@@ -447,30 +463,27 @@ class Datablock:
         path = self.path(topic)
         return make_download_url(path)
 
-    def valid(
-        self,
-    ):
-        def validpath(path):
-            if path.endswith("None"): #If topic filename ends with 'None', it is considered to be valid by default
-                result = True
+    def validpath(self, path):
+        if path.endswith("None"): #If topic filename ends with 'None', it is considered to be valid by default
+            result = True
+        else:
+            fs, _ = fsspec.url_to_fs(path)
+            if 'file' not in fs.protocol:
+                result = fsspec.filesystem("gcs").exists(path)
             else:
-                fs, _ = fsspec.url_to_fs(path)
-                if 'file' not in fs.protocol:
-                    result = fsspec.filesystem("gcs").exists(path)
-                else:
-                    result = os.path.exists(path) #TODO: Why not handle this case using fsspec? 
-            self.log.debug(f"{self.anchor()}: path {path} valid: {result}") 
-            return result
-
+                result = os.path.exists(path) #TODO: Why not handle this case using fsspec? 
+        self.log.debug(f"{self.anchor()}: path {path} valid: {result}") 
+        return result
+    
+    def valid(self,):
         results = []
-
         if hasattr(self, "FILES"):
             results += [
-                validpath(self.path(topic))
+                self.validpath(self.path(topic))
                 for topic in self.FILES
             ]
         else:
-            results += [validpath(self.path())]
+            results += [self.validpath(self.path())]
         result = all(results)
         self.log.debug(f"validation {results=}")
         return result
@@ -488,7 +501,7 @@ class Datablock:
             if not self.valid():
                 self.__pre_build__(tag).__build__().__post_build__(tag)
             else:
-                self.log.verbose(f"Skipping existing datablock: {self.dirpath()}")
+                self.log.verbose(f"Skipping existing datablock: {self.hashpath()}")
         finally:
             if self.capture_build_output:
                 sys.stdout = stdout
@@ -530,7 +543,7 @@ class Datablock:
 
     def read(self, topic=None):
         if self.has_topics():
-            _ =  self.__read__(self, topic=None)
+            _ =  self.__read__(topic)
         else:
             _ = self.__read__()
         return _
@@ -591,9 +604,14 @@ class Datablock:
     @property
     def hash(self):
         if self._hash is None:
+            if hasattr(self, "FILES"):
+                topics = [f"_topic_{topic}={file}" for topic, file in self.FILES.items()]
+            else:
+                topics = ["None"]
             hivehandle = os.path.join(
                 f"version={self.version}",
-                *[f"{key}={val}" for key, val in self.scopespec.items()]
+                *topics,
+                *[f"_scope_{key}={val}" for key, val in self.scopespec.items()]
             )
             sha = hashlib.sha256()
             sha.update(hivehandle.encode())
@@ -666,8 +684,7 @@ class Datablock:
                 + "."
                 + cls.__name__
             ),
-            "scope",
-            "#",
+            ".scope",
         )
         scopeanchorpath = os.path.join(
             root,
@@ -709,12 +726,11 @@ class Datablock:
             cls.__module__
             + "."
             + cls.__name__,
-            "journal",
+            ".journal",
         )
         journalanchorpath = os.path.join(
             root,
             journalanchor,
-            '#',
         )
         if ensure:
             fs, _ = fsspec.url_to_fs(journalanchorpath)
@@ -723,10 +739,7 @@ class Datablock:
 
     def hashpath(self, *, ensure: bool = True):
         anchorpath = self.anchorpath()
-        if self._autohash:
-            hashpath = os.path.join(anchorpath, '#', self.hash)
-        else:
-            hashpath = os.path.join(anchorpath, self.hash)
+        hashpath = os.path.join(anchorpath, self.hash)
         if ensure:
             fs, _ = fsspec.url_to_fs(hashpath)
             fs.makedirs(hashpath, exist_ok=True)
@@ -757,7 +770,7 @@ class Datablock:
             for k, v in self.spec.items():
                 value = getattr(self.config, k)
                 if isinstance(v, str) and v.endswith('#') and isinstance(value, Datablock):
-                    scopespec[k] = f"{repr(v)}#{value.hash()}"
+                    scopespec[k] = f"{v}#{value.anchor()}/{value.hash}"
                 else:
                     scopespec[k] = v
             self._scopespec = scopespec
@@ -850,6 +863,11 @@ def datablock_method(
 
     
 class DatabatchBuilder:
+    def __init__(self, *, verbose: bool = False, debug: bool = False,):
+        self.verbose = verbose
+        self.debug = debug
+        self.log = Logger(verbose=verbose, debug=debug)
+        
     @property
     def tag(self):
         return None
