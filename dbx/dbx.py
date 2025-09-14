@@ -14,6 +14,7 @@ import traceback as tb
 import typing
 from typing import Union, Optional
 import uuid
+import yaml
 
 import git
 
@@ -188,6 +189,21 @@ def exec(s=None):
 
 def exec_print(argstr=None):
     print(exec(argstr))
+
+
+def write_yaml(data, path, *, log=Logger(), debug: bool = False):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, "w") as f:
+        yaml.dump(data, f)
+        log.info(f"WROTE {path}")
+
+
+def read_yaml(path, *, log=Logger(), debug: bool = False):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, "r") as f:
+        data = yaml.safe_load(f)
+        log.info(f"READ {path}")
+    return data
 
 
 def write_json(data, path, *, log=Logger(), debug: bool = False):
@@ -539,10 +555,10 @@ class Datablock:
         if hasattr(self, "FILES"):
             for topic in self.FILES:
                 self.dirpath(topic, ensure=True)
-                self._leave_breadcrumbs_at_path(self.path(topic))
+                self.leave_breadcrumbs_at_path(self.path(topic))
         else:
             self.dirpath(ensure=True)
-            self._leave_breadcrumbs_at_path(self.path())
+            self.leave_breadcrumbs_at_path(self.path())
         return self
 
     def read(self, topic=None):
@@ -680,7 +696,7 @@ class Datablock:
             columns = ['hash', 'datetime'] + [c for c in df.columns if c not in ('hash', 'datetime', 'event', 'uuid')] + ['event']
             df = df.sort_values('datetime', ascending=False)[columns].reset_index(drop=True)
         else:
-            df = pd.Dataframe()
+            df = None
         return df
 
     def scopes(self):
@@ -841,7 +857,7 @@ class Datablock:
         config = replace(config, **replacements)
         return config
 
-    def _leave_breadcrumbs_at_path(self, path):
+    def leave_breadcrumbs_at_path(self, path):
         fs, _ = fsspec.url_to_fs(path)
         with fs.open(path, "w") as f:
             f.write("")
