@@ -1,5 +1,5 @@
 from collections.abc import Iterable
-from dataclasses import dataclass, fields, asdict, replace
+from dataclasses import dataclass, fields, asdict, replace, is_dataclass
 import datetime
 import hashlib
 import importlib
@@ -43,6 +43,7 @@ class Logger:
         verbose: bool = False,
         debug: bool = False,
         select: bool = False,
+        detailed: bool = False,
         name: Optional[str] = None,
         stack_depth: int = 2,
     ):
@@ -57,14 +58,21 @@ class Logger:
             self.allowed.append("VERBOSE")
         if select:
             self.allowed.append("SELECT")
+        if detailed:
+            self.allowed.append("DETAIL")
         self.stack_depth = stack_depth
         self.name = name
-        if self.name is None:
-            self.name = f"{inspect.stack()[stack_depth].function}"
 
     def _print(self, prefix, msg):
+        if self.name is None:
+            stack = inspect.stack()
+            frame = stack[self.stack_depth-1]
+            func = frame.function
+            name = f"{func}"
+        else:
+            name = self.name
         if prefix in self.allowed:
-            print(f"{prefix}: {self.name}: {msg}")
+            print(f"{prefix}: {name}: {msg}")
 
     def warning(self, msg):
         self._print("WARNING", msg)
@@ -80,6 +88,9 @@ class Logger:
 
     def select(self, msg):
         self._print("SELECT", msg)
+
+    def detailed(self, msg):
+        self._print("DETAILED", msg)
 
     def silent(self, mst):
         pass
@@ -195,14 +206,14 @@ def write_yaml(data, path, *, log=Logger(), debug: bool = False):
     fs, _ = fsspec.url_to_fs(path)
     with fs.open(path, "w") as f:
         yaml.dump(data, f)
-        log.info(f"WROTE {path}")
+        log.verbose(f"WROTE {path}")
 
 
 def read_yaml(path, *, log=Logger(), debug: bool = False):
     fs, _ = fsspec.url_to_fs(path)
     with fs.open(path, "r") as f:
         data = yaml.safe_load(f)
-        log.info(f"READ {path}")
+        log.verbose(f"READ {path}")
     return data
 
 
@@ -210,14 +221,14 @@ def write_json(data, path, *, log=Logger(), debug: bool = False):
     fs, _ = fsspec.url_to_fs(path)
     with fs.open(path, "w") as f:
         json.dump(data, f)
-        log.info(f"WROTE {path}")
+        log.verbose(f"WROTE {path}")
 
 
 def read_json(path, *, log=Logger(), debug: bool = False):
     fs, _ = fsspec.url_to_fs(path)
     with fs.open(path, "r") as f:
         data = json.load(f)
-        log.info(f"READ {path}")
+        log.verbose(f"READ {path}")
     return data
 
 
@@ -226,13 +237,13 @@ def write_tensor(tensor, path, *, log=Logger(), debug: bool = False):
     array = tensor.numpy()
     with fs.open(path, "wb") as f:
         np.save(f, array)
-        log.info(f"WROTE {path}")
+        log.verbose(f"WROTE {path}")
 
 def read_tensor(path, *, log=Logger(), debug: bool = False):
     fs, _ = fsspec.url_to_fs(path)
     with fs.open(path, "rb") as f:
         array = np.load(f)
-        log.info(f"READ {path}")
+        log.verbose(f"READ {path}")
         tensor = torch.from_numpy(array)
     return tensor
 
@@ -241,7 +252,7 @@ def write_npz(path, *, log=Logger(), debug: bool = False, **kwargs):
     fs, _ = fsspec.url_to_fs(path)
     with fs.open(path, "wb") as f:
         np.savez(f, **kwargs)
-        log.info(f"WROTE {list(kwargs.keys())} to {path}")
+        log.verbose(f"WROTE {list(kwargs.keys())} to {path}")
 
 
 def read_npz(path, *keys, log=Logger(), debug: bool = False):
@@ -249,7 +260,7 @@ def read_npz(path, *keys, log=Logger(), debug: bool = False):
     with fs.open(path, "rb") as f:
         data = np.load(f)
         results = [data[k] for k in keys]
-        log.info(f"READ {list(keys)} from {path}")
+        log.verbose(f"READ {list(keys)} from {path}")
         return results
 
 
@@ -352,10 +363,13 @@ class Datablock:
         anchored: bool = True,
         hash: Optional[str] = None,
         tag: Optional[str] = None,
+        info: bool = True,
         verbose: bool = False,
         debug: bool = False,
+        detailed: bool = False,
         capture_build_output: bool = False,
         gitrepo: str  = None,
+        **kwargs,
     ):
         self.__setstate__(dict(
             root=root,
@@ -363,16 +377,20 @@ class Datablock:
             anchored=anchored,
             hash=hash,
             tag=tag,
+            info=info,
             verbose=verbose,
             debug=debug,
+            detailed=detailed,
             capture_build_output=capture_build_output,
             gitrepo=gitrepo,
+            **kwargs,
         ))
         
     def __setstate__(
         self,
         kwargs,
     ):
+        processed = []
         self.root = kwargs.get('root')
         self._autoroot = False
         if self.root is None:
@@ -380,49 +398,65 @@ class Datablock:
             self._autoroot = True
         if self.root is None:
             raise ValueError(f"None root for {self.__class__.__name__}: maybe set DBXROOT?")
+        processed.append('root')
         self.spec = kwargs.get('spec')
+        processed.append('spec')
         self.anchored = kwargs.get('anchored')
+        processed.append('anchored')
         self._hash = kwargs.get('hash')
+        processed.append('hash')
         self.tag = kwargs.get('tag')
+        processed.append('tag')
         #
-        self.verbose = bool(os.environ.get('DBXVERBOSE', kwargs.get('verbose')))
-        self.debug = bool(os.environ.get('DBXDEBUG', kwargs.get('debug')))
+        self.info = eval(os.environ.get('DBXINFO', str(kwargs.get('info'))))
+        self.verbose = eval(os.environ.get('DBXVERBOSE', str(kwargs.get('verbose'))))
+        self.debug = eval(os.environ.get('DBXDEBUG', str(kwargs.get('debug'))))
+        self.detailed = eval(os.environ.get('DBXDETAILED', str(kwargs.get('detailed'))))
         self.gitrepo = os.environ.get('DBXREPO', kwargs.get('gitrepo'))
         self.capture_build_output = bool(kwargs.get('capture_build_output'))
-
-        if self.root is None:
-            self.root = os.environ.get('DBXSPACE')
-            if self.root is None:
-                if hasattr(self, 'ROOT'):
-                    self.root = self.ROOT
-                
+        processed.extend(['verbose', 'debug', 'gitrepo', 'capture_build_output'])  
         self.log = Logger(
             debug=self.debug,
             verbose=self.verbose,
+            detailed=self.detailed,
+            info=self.info,
             name=self.anchor(),
         )
+        #
         if isinstance(self.spec, str):
             self.spec = read_json(self.spec, debug=self.debug)
         if self.spec is None:
             self.spec = asdict(self.CONFIG())
         self.config = self._spec_to_config(self.spec)
-        self._scopespec = None
+        self._scope = None
         self._autohash = self._hash is None
+
+        for k, v in kwargs.items():
+            if k not in processed:
+                setattr(self, k, v)
+        self.parameters = list(kwargs.keys())
         self.__post_init__()
 
     def __getstate__(self):
-        return self.kwargs()
+        return dict(
+            root=self.root if not self._autoroot else None,
+            spec=self.spec,
+            anchored=self.anchored,
+            hash=self.hash if not self._autohash else None,
+            tag=self.tag,
+            info=self.info,
+            verbose=self.verbose,
+            debug=self.debug,
+            detailed=self.detailed,
+            capture_build_output=self.capture_build_output,
+            gitrepo=self.gitrepo,
+            **{k: getattr(self, k) for k in self.parameters 
+             if k not in ('root', 'spec', 'anchored', 'hash', 'tag', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
+            }
+        )
 
     def __post_init__(self):
         ...
-
-    @property
-    def version(self):
-        if hasattr(self, 'VERSION'):
-            version = self.VERSION
-        else:
-            version = None
-        return version
 
     def __repr__(self):
         if self._autoroot:
@@ -442,6 +476,13 @@ class Datablock:
         r = f"{self.anchor()}({argskwargsrepr})"
         self.log.debug(f"{self.anchor()}: repr: {r}")
         return r
+    @property
+    def version(self):
+        if hasattr(self, 'VERSION'):
+            version = self.VERSION
+        else:
+            version = None
+        return version
     
     @property
     def uuid(self):
@@ -450,17 +491,7 @@ class Datablock:
         return self._uuid
 
     def kwargs(self):
-        return dict(
-            root=self.root if not self._autoroot else None,
-            spec=self.spec,
-            verbose=self.verbose,
-            debug=self.debug,
-            hash=self._hash if not self._autohash else None,
-            tag=self.tag,
-            anchored=self.anchored,
-            capture_build_output=self.capture_build_output,
-            gitrepo=self.gitrepo,
-        )
+        return self.__getstate__()
 
     def path(
         self,
@@ -474,8 +505,8 @@ class Datablock:
         else:
             dirpath = self.dirpath(topic)
             topicfile = self.FILES[topic]
-        path = os.path.join(dirpath, topicfile) if topicfile is not None else dirpath
-        if ensure_dirpath:
+        path = os.path.join(dirpath, topicfile) if topicfile is not None else None
+        if ensure_dirpath and dirpath is not None:
             self.ensure_path(dirpath)      
         return path
 
@@ -489,7 +520,7 @@ class Datablock:
         return make_download_url(path)
 
     def validpath(self, path):
-        if path.endswith("None"): #If topic filename ends with 'None', it is considered to be valid by default
+        if path is None or path.endswith("None"): #If topic filename ends with 'None', it is considered to be valid by default
             result = True
         else:
             fs, _ = fsspec.url_to_fs(path)
@@ -631,9 +662,8 @@ class Datablock:
             else:
                 topics = ["None"]
             hivehandle = os.path.join(
-                f"version={self.version}",
                 *topics,
-                *[f"_scope_{key}={val}" for key, val in self.scopespec.items()]
+                *[f"{key}={val}" for key, val in self._scope_.items()]
             )
             sha = hashlib.sha256()
             sha.update(hivehandle.encode())
@@ -641,20 +671,12 @@ class Datablock:
         return self._hash
             
     def scope(self):
-        versionpath = self.Versionpath(self.root, self.hash)
-        vfs, _ = fsspec.url_to_fs(versionpath)
-        if not vfs.exists(versionpath):
+        yscopepath = self.Scopepath(self.root, self.hash, 'yaml')
+        yfs, _ = fsspec.url_to_fs(yscopepath)
+        if not yfs.exists(yscopepath):
             return
-        with vfs.open(versionpath, 'r') as vf:
-            version = vf.read()
-        #
-        jconfigpath = self.Specpath(self.root, self.hash, 'json')
-        jcfs, _ = fsspec.url_to_fs(jconfigpath)
-        if not jcfs.exists(jconfigpath):
-            return
-        with jcfs.open(jconfigpath, 'r') as jcf:
-            spec = json.load(jcf)
-        return version, spec
+        scope = read_yaml(yscopepath)
+        return scope
     
     @staticmethod
     def Scopes(cls, root):
@@ -664,18 +686,22 @@ class Datablock:
             df = None
         else:
             paths = list(fs.ls(scopeanchorpath))
-            specfiles_ = [os.path.join(path, 'cfg.parquet') for path in paths]
-            specfiles = [f for f in specfiles_ if fs.exists(f)]
-            hashes = [os.path.dirname(f).removeprefix(scopeanchorpath).removeprefix('/') for f in specfiles]
-            if len(specfiles) > 0:
+            scopefiles_ = [
+                os.path.join(path, 'scope.parquet') 
+                for path in paths
+            ]
+            scopefiles = [f for f in scopefiles_ if fs.exists(f)]
+            hashes = [os.path.dirname(f).removeprefix(scopeanchorpath).removeprefix('/') for f in scopefiles]
+            if len(scopefiles) > 0:
                 dfs = []
-                for specfile in specfiles:
-                    _df = pd.read_parquet(specfile)
+                for scopefile in scopefiles:
+                    _df = pd.read_parquet(scopefile)
                     dfs.append(_df)
                 df = pd.concat(dfs)
                 df.index = hashes
             else:
                 df = pd.DataFrame(index=hashes)
+            df = df.reset_index().rename(columns={'index': 'hash'})
         return df
 
     @staticmethod
@@ -683,18 +709,20 @@ class Datablock:
         journaldirpath = cls._journalanchorpath(root)
         fs, _ = fsspec.url_to_fs(journaldirpath)
         files = list(fs.ls(journaldirpath))
+        parquet_files = [f for f in files if f.endswith('.parquet')]
         
-        if len(files) > 0:
+        if len(parquet_files) > 0:
             dfs = []
-            for file in files:
+            for file in parquet_files:
                 _df = pd.read_parquet(file)
                 if 'revision' not in _df.columns:
-                    _df = _df.rename(columns={'version': 'revision'})
+                    _df = _df.rename(columns={'version': 'revision',})
                 dfs.append(_df)
             df = pd.concat(dfs)
             # TODO: FIX uuid; currently not unique
             columns = ['hash', 'datetime'] + [c for c in df.columns if c not in ('hash', 'datetime', 'event', 'uuid')] + ['event']
             df = df.sort_values('datetime', ascending=False)[columns].reset_index(drop=True)
+            df = df.rename(columns={'build_log': 'log'})
         else:
             df = None
         return df
@@ -732,17 +760,13 @@ class Datablock:
             fs, _ = fsspec.url_to_fs(scopepath)
             fs.makedirs(scopepath, exist_ok=True)
         return scopepath
-
-    @classmethod
-    def Versionpath(cls, root, hash, *, ensure: bool = True):
-        return os.path.join(cls._scopepath(root, hash, ensure=ensure), 'version')
     
     @classmethod
-    def Specpath(cls, root, hash, kind, *, ensure: bool = True):
-        if kind == 'json':
-            return os.path.join(cls._scopepath(root, hash, ensure=ensure), 'cfg.json')
+    def Scopepath(cls, root, hash, kind, *, ensure: bool = True):
+        if kind == 'yaml':
+            return os.path.join(cls._scopepath(root, hash, ensure=ensure), 'scope.yaml')
         elif kind == 'parquet':
-            return os.path.join(cls._scopepath(root, hash, ensure=ensure), 'cfg.parquet')
+            return os.path.join(cls._scopepath(root, hash, ensure=ensure), 'scope.parquet')
         else:
             raise ValueError(f"Unknown configpath kind: {kind}")
         
@@ -793,56 +817,69 @@ class Datablock:
         return dirpath
 
     @property
-    def scopespec(self):
-        if self._scopespec is None:
-            scopespec = {}
+    def _scope_(self):
+        if self._scope is None:
+            scope = {}
             for k, v in self.spec.items():
                 value = getattr(self.config, k)
                 if isinstance(v, str) and v.endswith('#') and isinstance(value, Datablock):
-                    scopespec[k] = f"{v}{value.anchor()}/{value.hash}"
+                    scope[k] = f"@{value.anchor()}/{value.hash}"
+                elif isinstance(v, str) and v.endswith('#'):
+                    v = v.removesuffix('#')
+                    scope[k] = v
+                elif is_dataclass(v):
+                    scope[k] = asdict(v)
                 else:
-                    v = v.removesuffix('#') if isinstance(v, str) else v
-                    scopespec[k] = v
-            self._scopespec = scopespec
-        return self._scopespec
+                    scope[k] = v
+            scope['version'] = self.version
+            self._scope = scope
+        return self._scope
 
     def _write_scope(self):
-        versionpath = self.Versionpath(self.root, self.hash)
-        vfs, _ = fsspec.url_to_fs(versionpath)
-        with vfs.open(versionpath, 'w') as vf:
-            vf.write(str(self.version))
-        assert vfs.exists(versionpath), f"Versionpath {versionpath} does not exist after writing"
         #
+        yscopepath = self.Scopepath(self.root, self.hash, 'yaml')
+        yfs, _ = fsspec.url_to_fs(yscopepath)
+        write_yaml(self._scope_, yscopepath)
+        assert yfs.exists(yscopepath), f"scopepath {yscopepath} does not exist after writing"
+        self.log.verbose(f"WROTE: SCOPE: yaml: {yscopepath}")
         #
-        jconfigpath = self.Specpath(self.root, self.hash, 'json')
-        jcfs, _ = fsspec.url_to_fs(jconfigpath)
-        with jcfs.open(jconfigpath, 'w') as jcf:
-            json.dump(self.scopespec, jcf)
-        assert jcfs.exists(jconfigpath), f"Configpath {jconfigpath} does not exist after writing"
+        pscopepath = self.Scopepath(self.root, self.hash, 'parquet')
+        pfs, _ = fsspec.url_to_fs(pscopepath)
+        scopedf = pd.DataFrame.from_records([self._scope_])
+        scopedf.to_parquet(pscopepath)
+        assert pfs.exists(pscopepath), f"scopepath {pscopepath} does not exist after writing"
         #
-        pconfigpath = self.Specpath(self.root, self.hash, 'parquet')
-        pcfs, _ = fsspec.url_to_fs(pconfigpath)
-        specdf = pd.DataFrame.from_records([self.scopespec])
-        specdf.to_parquet(pconfigpath)
-        assert pcfs.exists(pconfigpath), f"Configpath {pconfigpath} does not exist after writing"
-        #
-        self.log.verbose(f"wrote SCOPE: versionpath: {versionpath} and configpaths: {jconfigpath} and {pconfigpath}")
+        self.log.verbose(f"WROTE: SCOPE: parquet: {pscopepath}")
 
     def _write_journal_entry(self, event:str):
         hash = self.hash
         dt = str(datetime.datetime.now()).replace(' ', '-')
-        path = os.path.join(self._journalanchorpath(self.root), f"{hash}-{dt}.parquet")
+        key = f"{hash}-{dt}"
+
+        kwargs_path = os.path.join(self._journalanchorpath(self.root), f"{key}.yaml")
+        write_yaml(self.kwargs(), kwargs_path)
+        #
+        logpath = self.logpath()
+        if logpath is not None:
+            logfs, _ = fsspec.url_to_fs(logpath)
+            has_log = logfs.exists(logpath)
+        else:
+            has_log = False
+        #
+        journal_path = os.path.join(self._journalanchorpath(self.root), f"{key}.parquet")
         df = pd.DataFrame.from_records([{'datetime': dt,
                                          'version': self.version,
                                          'revision': self.revision, 
                                          'hash': hash,
-                                         'tag': self.tag,  
-                                         'uuid': self.uuid, 
-                                         'build_log': self.logpath(),
+                                         'tag': self.tag, 
+                                         'log': logpath if has_log else None,
                                          'event': event,
+                                         'kwargs': kwargs_path,
         }])
-        self.log.verbose(f"Wrote JOURNAL entry for event {repr(event)} with tag {repr(self.tag)} to path {path}")
-        df.to_parquet(path)
+        df.to_parquet(journal_path)
+        
+        self.log.verbose(f"Wrote JOURNAL entry for event {repr(event)} with tag {repr(self.tag)} "
+                         f"to journal_path {journal_path} and kwargs_path {kwargs_path}")
     
     def _spec_to_config(self, spec):
         config = self.CONFIG(**spec)
