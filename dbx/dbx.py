@@ -474,7 +474,7 @@ class Datablock:
         else:
             argskwargsrepr = argstr
         r = f"{self.anchor()}({argskwargsrepr})"
-        self.log.debug(f"{self.anchor()}: repr: {r}")
+        self.log.detailed(f"{self.anchor()}: repr: {r}")
         return r
     @property
     def version(self):
@@ -528,7 +528,7 @@ class Datablock:
                 result = fsspec.filesystem("gcs").exists(path)
             else:
                 result = os.path.exists(path) #TODO: Why not handle this case using fsspec? 
-        self.log.debug(f"{self.anchor()}: path {path} valid: {result}") 
+        self.log.detailed(f"{self.anchor()}: path {path} valid: {result}") 
         return result
     
     def valid(self,):
@@ -541,7 +541,7 @@ class Datablock:
         else:
             results += [self.validpath(self.path())]
         result = all(results)
-        self.log.debug(f"validation {results=}")
+        self.log.detailed(f"validation {results=}")
         return result
     
     def has_topics(self):
@@ -841,7 +841,7 @@ class Datablock:
         yfs, _ = fsspec.url_to_fs(yscopepath)
         write_yaml(self._scope_, yscopepath)
         assert yfs.exists(yscopepath), f"scopepath {yscopepath} does not exist after writing"
-        self.log.verbose(f"WROTE: SCOPE: yaml: {yscopepath}")
+        self.log.debug(f"WROTE: SCOPE: yaml: {yscopepath}")
         #
         pscopepath = self.Scopepath(self.root, self.hash, 'parquet')
         pfs, _ = fsspec.url_to_fs(pscopepath)
@@ -849,7 +849,7 @@ class Datablock:
         scopedf.to_parquet(pscopepath)
         assert pfs.exists(pscopepath), f"scopepath {pscopepath} does not exist after writing"
         #
-        self.log.verbose(f"WROTE: SCOPE: parquet: {pscopepath}")
+        self.log.debug(f"WROTE: SCOPE: parquet: {pscopepath}")
 
     def _write_journal_entry(self, event:str):
         hash = self.hash
@@ -878,7 +878,7 @@ class Datablock:
         }])
         df.to_parquet(journal_path)
         
-        self.log.verbose(f"Wrote JOURNAL entry for event {repr(event)} with tag {repr(self.tag)} "
+        self.log.debug(f"Wrote JOURNAL entry for event {repr(event)} with tag {repr(self.tag)} "
                          f"to journal_path {journal_path} and kwargs_path {kwargs_path}")
     
     def _spec_to_config(self, spec):
