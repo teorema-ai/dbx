@@ -7,6 +7,7 @@ import inspect
 import json
 import multiprocessing as mp
 import os
+import pickle
 import sys
 import threading
 import time
@@ -262,6 +263,18 @@ def read_npz(path, *keys, log=Logger(), debug: bool = False):
         results = [data[k] for k in keys]
         log.debug(f"READ {list(keys)} from {path}")
         return results
+    
+
+def write_pickle(obj, path):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, 'wb') as f:
+        pickle.dump(obj, f)
+
+
+def read_pickle(path):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, 'rb') as f:
+        return pickle.load(f)
 
 
 class IntRange(tuple):
