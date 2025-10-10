@@ -34,6 +34,8 @@ from scipy.stats import qmc
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
+import torch.multiprocessing as mp
+
 
 
 class Logger:
@@ -49,6 +51,7 @@ class Logger:
         select: bool = False,
         detailed: bool = False,
         name: Optional[str] = None,
+        datetime: bool = True,
         stack_depth: int = 2,
     ):
         self._warning = eval(os.environ.get('DBXWARNING', str(warning)))
@@ -72,6 +75,7 @@ class Logger:
             self.allowed.append("DETAIL")
         self.stack_depth = stack_depth
         self.name = name
+        self.datetime = datetime
 
     def _print(self, prefix, msg):
         if self.name is None:
@@ -82,7 +86,8 @@ class Logger:
         else:
             name = self.name
         if prefix in self.allowed:
-            print(f"{prefix}: {name}: {msg}")
+            dt = f"{datetime.datetime.now().isoformat()}: " if self.datetime else ""
+            print(f"{prefix}: {dt}{name}: {msg}")
 
     def warning(self, msg):
         self._print("WARNING", msg)
@@ -368,6 +373,9 @@ def quote(obj):
 
 
 class Datashard:
+    def __init__(self):
+        self.device = 'cpu'
+
     def build(self):
           pass
      
@@ -375,6 +383,7 @@ class Datashard:
         return repr(self)
     
     def to(self, device):
+        self.device = device
         return self
 
 
@@ -424,7 +433,9 @@ class Datablock(Datashard):
         gitrepo: str  = None,
         **kwargs,
     ):
+        super().__init__()
         self.__setstate__(dict(
+            device=self.device,
             root=root,
             spec=spec,
             anchored=anchored,
@@ -444,6 +455,8 @@ class Datablock(Datashard):
         kwargs,
     ):
         processed = []
+        self.device = kwargs.get('device', 'cpu')
+        processed.append('device')
         self.root = kwargs.get('root')
         self._autoroot = False
         if self.root is None:
@@ -492,6 +505,7 @@ class Datablock(Datashard):
 
     def __getstate__(self):
         return dict(
+            device=self.device,
             root=self.root if not self._autoroot else None,
             spec=self.spec,
             anchored=self.anchored,
@@ -504,7 +518,7 @@ class Datablock(Datashard):
             capture_build_output=self.capture_build_output,
             gitrepo=self.gitrepo,
             **{k: getattr(self, k) for k in self.parameters 
-             if k not in ('root', 'spec', 'anchored', 'hash', 'tag', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
+             if k not in ('device', 'root', 'spec', 'anchored', 'hash', 'tag', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
             }
         )
 
@@ -512,6 +526,8 @@ class Datablock(Datashard):
         ...
 
     def __repr__(self):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
+        # computed using the older version of __repr__().
         if self._autoroot:
             argstr = f"spec={repr(self.spec)}"
         else:
@@ -745,6 +761,8 @@ class Datablock(Datashard):
     
     @property
     def hash(self):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
+        # computed with the older code.
         if self._hash is None:
             if hasattr(self, "TOPICFILES"):
                 topics = [f"_topic_{topic}={file}" for topic, file in self.TOPICFILES.items()]
@@ -752,7 +770,7 @@ class Datablock(Datashard):
                 topics = ["None"]
             hivehandle = os.path.join(
                 *topics,
-                *[f"{key}={repr(val)}" for key, val in self._scope_.items()]
+                *[f"{key}={val}" for key, val in self._scope_.items()]
             )
             sha = hashlib.sha256()
             sha.update(hivehandle.encode())
@@ -913,6 +931,8 @@ class Datablock(Datashard):
 
     @property
     def _scope_(self):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
+        # computed using the older version of _scope_()
         if self._scope is None:
             scope = {}
             for k, v in self.spec.items():
@@ -924,8 +944,10 @@ class Datablock(Datashard):
                     scope[k] = v
                 elif is_dataclass(v):
                     scope[k] = asdict(v) #TODO: call to a TBD recursive _scope_ on the container?
-                else:
+                elif not isinstance(v, str):
                     scope[k] = repr(v)
+                else:
+                    scope[k] = v
             scope['version'] = self.version
             self._scope = scope
         return self._scope
@@ -1192,7 +1214,7 @@ class TorchMultiprocessingDatabatchBuilder(DatabatchBuilder):
             )
 
 
-class MultithreadingDatashardBuilder:
+class TorchMultithreadingDatashardBatchBuilder:
     def __init__(self, *, devices: list[str] = 'cuda', log: Logger = Logger()):
         if isinstance(devices, str):
             devices = [devices]
@@ -1271,4 +1293,103 @@ class MultithreadingDatashardBuilder:
         return device_args, device_kwargs
     
 
+class TorchMultiprocessingDatashardBatchBuilder(TorchMultithreadingDatashardBatchBuilder):
+    def __init__(self, *, devices: list[str] = None, log: Logger = Logger()):
+        if isinstance(devices, str):
+            devices = [devices]
+        self.devices = devices
+        self.log = log
 
+    def build_shards(self, shards: Sequence[Datashard], *ctx_args, **ctx_kwargs):
+        if len(shards) > 0:
+            result_queue = mp.Queue()
+            done_queue = mp.Queue()
+            abort_event = mp.Event()
+            progress_bar = tqdm.tqdm(total=len(shards))
+            shard_lists = np.array_split(shards, len(self.devices))
+            shard_offsets = np.cumsum([0] + [len(shard_list) for shard_list in shard_lists])
+            processes = [
+                mp.Process(target=self.__build_shards__, args=(shard_list, ctx_args, ctx_kwargs, shard_offset, f"{i}", device, result_queue, done_queue, abort_event))
+                for i, (shard_list, shard_offset, device) in enumerate(zip(shard_lists, shard_offsets, self.devices))
+            ]
+            self.log.verbose(f"Building {len(shards)} feature shards with {len(self.devices)} processes")
+            done_idxs = []
+            exc = None
+            try:
+                for process in processes:
+                    process.start()
+                for shard in shards:
+                    del shard
+                gc.collect()
+                while len(done_idxs) < len(shards):
+                    pexc, ptbstr = None, None
+                    success, proc, idx, payload = result_queue.get()
+                    if success:
+                        done_idxs.append(idx)
+                        progress_bar.update(1)
+                    else:
+                        pexc, ptbstr = payload
+                        self.log.info(f"Received exception from process {proc}, shard with index {idx}: {shards[idx]}")
+                        self.log.info(f"Exception: {pexc}")
+                        self.log.info(f"Traceback:\n{ptbstr}")
+                        self.log.info(f"Abandoning result_queue polling.")
+                        break
+                self.log.debug(f"Production loop done")
+            except Exception as e:
+                exc = e
+                self.log.info(f"Caught exception in production loop\nException: {e}")
+                tbstr = '\n'.join(tb.format_tb(e.__traceback__))
+                self.log.info(f"Traceback:\n{tbstr}")
+                abort_event.set()
+            finally:
+                self.log.debug(f"Feeding done_queue")
+                for _ in self.devices:
+                    done_queue.put(None)
+                self.log.debug(f"Joining processes")
+                for process in processes:
+                    process.join()
+                self.log.debug("Processes successfully joined")
+            if pexc is not None:
+                self.log.verbose(f"Reraising exception from process {proc}, shard {idx}: {shards[idx]}")
+                raise(pexc)
+            if exc is not None:
+                self.log.verbose("Reraising production loop exception")
+                raise(exc)
+        return shards
+    
+    def __build_shards__(self, shards: Sequence[Datashard], ctx_args, ctx_kwargs, offset: int, process: str, device: str, result_queue: mp.Queue, done_queue: mp.Queue, abort_event: mp.Event):
+        self.log.debug(f"Building {len(shards)} feature shards on process: {process}, device: {device}")
+        if device is not None:
+            device_ctx_args, device_ctx_kwargs = self.__args_kwargs_to_device__(ctx_args, ctx_kwargs, device)
+        else:
+            device_ctx_args, device_ctx_kwargs = ctx_args, ctx_kwargs
+        exception = None
+        for i, shard in enumerate(shards):
+            exception = None
+            try:
+                if abort_event.is_set():
+                    break
+                shard.to(device).build(*device_ctx_args, **device_ctx_kwargs).to('cpu')
+            except Exception as e:
+                exception = e
+                self.log.info(f"ERROR building feature shard {shard} on process: {process}, device: {device}")
+            finally:
+                del shard
+                gc.collect()
+            if exception is not None:
+                tbstr = '\n'.join(tb.format_tb(exception.__traceback__))
+                result_queue.put((False, process, offset+i, (exception, tbstr)))
+                break
+            result_queue.put((True, process, offset+i, None))
+        del device_ctx_args, device_ctx_kwargs
+        gc.collect()
+        if exception is None:
+            self.log.debug(f"Done building {len(shards)} feature shards on process: {process}, device: {device}")
+        else:
+            self.log.debug(f"Abandoning building {len(shards)} feature shards on process: {process}, device: {device} due to an exception")
+        self.log.debug(f"Waiting on the done_queue on process: {process}, device: {device}")
+        while True:
+            item = done_queue.get()
+            if item is None:
+                self.log.debug(f"Done message received on the done_queue on process: {process}, device: {device}")
+                break
