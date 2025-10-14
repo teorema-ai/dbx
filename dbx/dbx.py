@@ -189,19 +189,16 @@ def eval_term(name):
     if isinstance(name, Iterable) and not isinstance(name, str):
         term = [eval_term(item) for item in name]
     elif isinstance(name, str):
-        if not (name.startswith("[") and name.endswith("]")) and not name.startswith("@"):
-            term = name
-        else:
-            if name.startswith("@"):
-                _name_ = name[1:-1] if name.endswith('#') else name[1:]
-            else:
-                _name_ = name[1:-1]
+        if name.startswith("@") or name.startswith("#") or name.startswith("$"):
+            _name_ = name[1:]
             funcstr, _ = get_funcstr_argkwargstr(_name_)
             if funcstr is None:
                 term, _ = get_named_const_and_cxt(_name_)
             else:
                 _, cxt = get_named_const_and_cxt(funcstr)
                 term = eval(_name_, cxt)
+        else:
+            term = name
     else:
         term = name
     return term
@@ -364,14 +361,6 @@ def make_halton_sampling_kwargs_sequence(N, range_kwargs, *, seed=123, precision
     return kwargs_list
 
 
-def quote(obj):
-    if isinstance(obj, str) and obj.startswith("@"):
-        quote = obj
-    else:
-        quote = f"@{repr(obj)}#"
-    return quote
-
-
 class Datashard:
     def __init__(self):
         self.device = 'cpu'
@@ -435,7 +424,6 @@ class Datablock(Datashard):
     ):
         super().__init__()
         self.__setstate__(dict(
-            device=self.device,
             root=root,
             spec=spec,
             anchored=anchored,
@@ -492,8 +480,15 @@ class Datablock(Datashard):
         if isinstance(self.spec, str):
             self.spec = read_json(self.spec, debug=self.debug)
         if self.spec is None:
-            self.spec = asdict(self.CONFIG())
-        self.config = self._spec_to_config(self.spec)
+            if self._hash is None:
+                self.spec = asdict(self.CONFIG())
+            else:
+                self.spec = ModuleNotFoundError
+        if self._hash is None:
+            self.config = self._spec_to_config(self.spec)
+        else:
+            self.config = None
+        self._spec = None
         self._scope = None
         self._autohash = self._hash is None
 
@@ -521,6 +516,14 @@ class Datablock(Datashard):
              if k not in ('device', 'root', 'spec', 'anchored', 'hash', 'tag', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
             }
         )
+    
+    def set(self, **kwargs):
+        _kwargs = copy.deepcopy(self._kwargs_)
+        _kwargs.update(**kwargs)
+        return self.__class__(**_kwargs)
+    
+    def replace(self, **kwargs):
+        return self.set(**kwargs)
 
     def __post_init__(self):
         ...
@@ -529,9 +532,9 @@ class Datablock(Datashard):
         #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
         # computed using the older version of __repr__().
         if self._autoroot:
-            argstr = f"spec={repr(self.spec)}"
+            argstr = f"spec={repr(self._spec_)}"
         else:
-            argstr = ', '.join((repr(self.root), f"spec={repr(self.spec)}"))
+            argstr = ', '.join((repr(self.root), f"spec={self._spec_}"))
         kwargslist = []
         if not self.anchored:
             kwargslist.append('anchored=False')
@@ -560,7 +563,8 @@ class Datablock(Datashard):
             self._uuid = str(uuid.uuid4())
         return self._uuid
 
-    def kwargs(self):
+    @property
+    def _kwargs_(self):
         return self.__getstate__()
 
     def filepath(
@@ -671,6 +675,7 @@ class Datablock(Datashard):
 
     def __pre_build__(self, *args, **kwargs):
         self._write_scope()
+        self._write_kwargs()
         self._write_journal_entry(event="build:start",)
         return self
 
@@ -785,6 +790,15 @@ class Datablock(Datashard):
         scope = read_yaml(yscopepath)
         return scope
     
+    def kwargs(self):
+        kwargspath = self.Kwargspath(self.root, self.hash)
+        kfs, _ = fsspec.url_to_fs(kwargspath)
+        if not kfs.exists(kwargspath):
+            return
+        kwargs = read_yaml(kwargspath)
+        return kwargs
+    
+    
     @staticmethod
     def Scopes(cls, root):
         cls = eval_term(cls)
@@ -815,15 +829,16 @@ class Datablock(Datashard):
         return df
 
     @staticmethod
-    def Journal(cls, root):
-        cls = eval_term(cls)
+    def Journal(cls, root=None):
         if root is None:
             root = os.environ.get('DBXROOT')
-        journaldirpath = cls._journalanchorpath(root)
+        journaldirpath = Datablock._journalanchorpath(eval_term(cls), root)
         fs, _ = fsspec.url_to_fs(journaldirpath)
         files = list(fs.ls(journaldirpath))
         parquet_files = [f for f in files if f.endswith('.parquet')]
-        
+
+        log = Logger()
+        log.debug(f"READING JOURNAL: from {journaldirpath=}, files: {parquet_files}")
         if len(parquet_files) > 0:
             dfs = []
             for file in parquet_files:
@@ -861,6 +876,22 @@ class Datablock(Datashard):
             scopeanchor,
         )
         return scopeanchorpath
+    
+    @classmethod
+    def _kwargsanchorpath(cls, root):
+        kwargsanchor = os.path.join(
+            (
+                cls.__module__
+                + "."
+                + cls.__name__
+            ),
+            ".kwargs",
+        )
+        kwargsanchorpath = os.path.join(
+            root,
+            kwargsanchor,
+        )
+        return kwargsanchorpath
 
     @classmethod
     def _scopepath(cls, root, hash, *, ensure: bool = True):
@@ -875,6 +906,18 @@ class Datablock(Datashard):
         return scopepath
     
     @classmethod
+    def _kwargspath(cls, root, hash, *, ensure: bool = True):
+        kwargsanchorpath = cls._kwargsanchorpath(root)
+        kwargspath = os.path.join(
+            kwargsanchorpath,
+            hash,
+        )
+        if ensure:
+            fs, _ = fsspec.url_to_fs(kwargspath)
+            fs.makedirs(kwargspath, exist_ok=True)
+        return kwargspath
+    
+    @classmethod
     def Scopepath(cls, root, hash, kind, *, ensure: bool = True):
         if kind == 'yaml':
             return os.path.join(cls._scopepath(root, hash, ensure=ensure), 'scope.yaml')
@@ -883,15 +926,22 @@ class Datablock(Datashard):
         else:
             raise ValueError(f"Unknown configpath kind: {kind}")
         
+    @classmethod
+    def Kwargspath(cls, root, hash, *, ensure: bool = True):
+        return os.path.join(cls._kwargspath(root, hash, ensure=ensure), 'kwargs.yaml')
+        
     def logpath(self, *, ensure: bool = True):
         return os.path.join(self._scopepath(self.root, self.hash, ensure=ensure), 'log', f'{self.uuid}.log')
 
-    @classmethod
+    @staticmethod
     def _journalanchorpath(cls, root, *, ensure: bool = True):
-        journalanchor = os.path.join(
+        journalclassname = cls if isinstance(cls, str) else os.path.join(
             cls.__module__
             + "."
             + cls.__name__,
+        )
+        journalanchor = os.path.join(
+            journalclassname,
             ".journal",
         )
         journalanchorpath = os.path.join(
@@ -930,24 +980,35 @@ class Datablock(Datashard):
         return dirpath
 
     @property
+    def _spec_(self):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
+        # computed using the older version of _spec_
+        if self._spec is None:
+            _spec = {}
+            for k, v in self.spec.items():
+                value = getattr(self.config, k)
+                if isinstance(v, str) and isinstance(value, Datablock):
+                    if v.startswith('@'):
+                        _spec[k] = v
+                    elif v.startswith('#'):
+                        _spec[k] = f"@{value.anchor()}/{value.hash}"
+                    elif v.startswith('$'):
+                        _spec[k] = repr(value)
+                elif is_dataclass(v):
+                    _spec[k] = asdict(v) #TODO: call to a TBD recursive _scope_ on the container?
+                elif not isinstance(v, str):
+                    _spec[k] = repr(v)
+                else:
+                    _spec[k] = v
+            self._spec = _spec
+        return self._spec
+
+    @property
     def _scope_(self):
         #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
         # computed using the older version of _scope_()
         if self._scope is None:
-            scope = {}
-            for k, v in self.spec.items():
-                value = getattr(self.config, k)
-                if isinstance(v, str) and v.endswith('#') and isinstance(value, Datablock):
-                    scope[k] = f"@{value.anchor()}/{value.hash}"
-                elif isinstance(v, str) and v.endswith('#'):
-                    v = v.removesuffix('#')
-                    scope[k] = v
-                elif is_dataclass(v):
-                    scope[k] = asdict(v) #TODO: call to a TBD recursive _scope_ on the container?
-                elif not isinstance(v, str):
-                    scope[k] = repr(v)
-                else:
-                    scope[k] = v
+            scope = copy.deepcopy(self._spec_)
             scope['version'] = self.version
             self._scope = scope
         return self._scope
@@ -968,13 +1029,21 @@ class Datablock(Datashard):
         #
         self.log.debug(f"WROTE: SCOPE: parquet: {pscopepath}")
 
+    def _write_kwargs(self):
+        #
+        kwargspath = self.Kwargspath(self.root, self.hash,)
+        kfs, _ = fsspec.url_to_fs(kwargspath)
+        write_yaml(self._kwargs_, kwargspath)
+        assert kfs.exists(kwargspath), f"kwargspath {kwargspath} does not exist after writing"
+        self.log.debug(f"WROTE: KWARGS: yaml: {kwargspath}")
+
     def _write_journal_entry(self, event:str):
         hash = self.hash
         dt = str(datetime.datetime.now()).replace(' ', '-')
         key = f"{hash}-{dt}"
 
-        kwargs_path = os.path.join(self._journalanchorpath(self.root), f"{key}.yaml")
-        write_yaml(self.kwargs(), kwargs_path)
+        kwargs_path = os.path.join(self._journalanchorpath(self.__class__, self.root), f"{key}.yaml")
+        write_yaml(self._kwargs_, kwargs_path)
         #
         logpath = self.logpath()
         if logpath is not None:
@@ -983,7 +1052,7 @@ class Datablock(Datashard):
         else:
             has_log = False
         #
-        journal_path = os.path.join(self._journalanchorpath(self.root), f"{key}.parquet")
+        journal_path = os.path.join(self._journalanchorpath(self.__class__, self.root), f"{key}.parquet")
         df = pd.DataFrame.from_records([{'datetime': dt,
                                          'version': self.version,
                                          'revision': self.revision, 
@@ -1114,7 +1183,7 @@ class Databatch(Datablock):
                 tagi = f"run:{i}:{self.hash}"
                 datablock_method_args_kwargs = (
                     (self.DATABLOCK, 'build', {}),
-                    datablock.kwargs(),
+                    datablock._kwargs_,
                 )
                 datablock_method_args_kwargs_list.append(datablock_method_args_kwargs)
             self.builder(datablock_method_args_kwargs_list)
@@ -1184,6 +1253,15 @@ def datablock_method_multiprocessing(
             progress_bar.advance(progress_task, 1)
         return result
     
+
+def quote(obj):
+    if isinstance(obj, str) and obj.startswith("@"):
+        quote = obj
+    else:
+        quote = f"@{repr(obj)}#"
+    return quote
+
+
 
 class TorchMultiprocessingDatabatchBuilder(DatabatchBuilder):
     def __init__(self, *, num_gpus: int = 1):
