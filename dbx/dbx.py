@@ -6,6 +6,7 @@ import gc
 import hashlib
 import importlib
 import inspect
+import itertools
 import json
 import multiprocessing as mp
 import os
@@ -117,6 +118,10 @@ def journal(cls, root=None):
 
 def scopes(cls, root=None):
     return Datablock.Scopes(cls, root)
+
+
+def kwargs(cls, root=None):
+    return Datablock.Kwargs(cls, root)
 
 
 def gitrevision(repopath, *, log=Logger()):
@@ -420,6 +425,7 @@ class Datablock(Datashard):
         detailed: bool = False,
         capture_build_output: bool = False,
         gitrepo: str  = None,
+        slash_repr: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -435,6 +441,7 @@ class Datablock(Datashard):
             detailed=detailed,
             capture_build_output=capture_build_output,
             gitrepo=gitrepo,
+            slash_repr=slash_repr,
             **kwargs,
         ))
         
@@ -461,6 +468,8 @@ class Datablock(Datashard):
         processed.append('hash')
         self.tag = kwargs.get('tag')
         processed.append('tag')
+        self.slash_repr = kwargs.get('slash_repr')
+        processed.append('slash_repr')
         #
         self.info = eval(os.environ.get('DBXINFO', str(kwargs.get('info'))))
         self.verbose = eval(os.environ.get('DBXVERBOSE', str(kwargs.get('verbose'))))
@@ -488,6 +497,7 @@ class Datablock(Datashard):
             self.config = self._spec_to_config(self.spec)
         else:
             self.config = None
+        self.cfg = self.config
         self._spec = None
         self._scope = None
         self._autohash = self._hash is None
@@ -496,6 +506,7 @@ class Datablock(Datashard):
             if k not in processed:
                 setattr(self, k, v)
         self.parameters = list(kwargs.keys())
+        self.dt = datetime.datetime.now().isoformat().replace(' ', '-').replace(':', '-')
         self.__post_init__()
 
     def __getstate__(self):
@@ -512,13 +523,14 @@ class Datablock(Datashard):
             detailed=self.detailed,
             capture_build_output=self.capture_build_output,
             gitrepo=self.gitrepo,
+            slash_repr=self.slash_repr,
             **{k: getattr(self, k) for k in self.parameters 
-             if k not in ('device', 'root', 'spec', 'anchored', 'hash', 'tag', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
+             if k not in ('device', 'root', 'spec', 'anchored', 'hash', 'tag', 'slash_repr', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
             }
         )
     
     def set(self, **kwargs):
-        _kwargs = copy.deepcopy(self._kwargs_)
+        _kwargs = copy.deepcopy(self.__getstate__())
         _kwargs.update(**kwargs)
         return self.__class__(**_kwargs)
     
@@ -546,7 +558,14 @@ class Datablock(Datashard):
         else:
             argskwargsrepr = argstr
         r = f"{self.anchor()}({argskwargsrepr})"
+        if not self.slash_repr:
+            r = r.replace('\\', '')
         self.log.detailed(f"{self.anchor()}: repr: {r}")
+        return r
+    
+    def __str__(self):
+        r = self.__repr__()
+        r = r.replace('\\', '')
         return r
     
     @property
@@ -562,10 +581,6 @@ class Datablock(Datashard):
         if not hasattr(self, '_uuid'):
             self._uuid = str(uuid.uuid4())
         return self._uuid
-
-    @property
-    def _kwargs_(self):
-        return self.__getstate__()
 
     def filepath(
         self,
@@ -659,8 +674,9 @@ class Datablock(Datashard):
     def build(self, *args, **kwargs):
         if self.capture_build_output:
             stdout = sys.stdout
-            outfs, _ = fsspec.url_to_fs(self.capture_out)
-            captured_stdout_stream = outfs.open(self.logpath(), "w", encoding="utf-8")
+            logpath = self._logpath()
+            outfs, _ = fsspec.url_to_fs(logpath)
+            captured_stdout_stream = outfs.open(logpath, "w", encoding="utf-8")
             sys.stdout = captured_stdout_stream
         try:
             if not self.valid():
@@ -781,23 +797,6 @@ class Datablock(Datashard):
             sha.update(hivehandle.encode())
             self._hash = sha.hexdigest()
         return self._hash
-            
-    def scope(self):
-        yscopepath = self.Scopepath(self.root, self.hash, 'yaml')
-        yfs, _ = fsspec.url_to_fs(yscopepath)
-        if not yfs.exists(yscopepath):
-            return
-        scope = read_yaml(yscopepath)
-        return scope
-    
-    def kwargs(self):
-        kwargspath = self.Kwargspath(self.root, self.hash)
-        kfs, _ = fsspec.url_to_fs(kwargspath)
-        if not kfs.exists(kwargspath):
-            return
-        kwargs = read_yaml(kwargspath)
-        return kwargs
-    
     
     @staticmethod
     def Scopes(cls, root):
@@ -810,16 +809,43 @@ class Datablock(Datashard):
             df = None
         else:
             paths = list(fs.ls(scopeanchorpath))
-            scopefiles_ = [
-                os.path.join(path, 'scope.parquet') 
-                for path in paths
-            ]
-            scopefiles = [f for f in scopefiles_ if fs.exists(f)]
+            scopefiles_ = list(itertools.chain.from_iterable(
+                fs.ls(path) for path in paths
+            ))
+            scopefiles = [f for f in scopefiles_ if fs.exists(f) and f.endswith('.parquet')]
             hashes = [os.path.dirname(f).removeprefix(scopeanchorpath).removeprefix('/') for f in scopefiles]
             if len(scopefiles) > 0:
                 dfs = []
                 for scopefile in scopefiles:
                     _df = pd.read_parquet(scopefile)
+                    dfs.append(_df)
+                df = pd.concat(dfs)
+                df.index = hashes
+            else:
+                df = pd.DataFrame(index=hashes)
+            df = df.reset_index().rename(columns={'index': 'hash'})
+        return df
+
+    @staticmethod
+    def Kwargs(cls, root):
+        cls = eval_term(cls)
+        if root is None:
+            root = os.environ.get('DBXROOT')
+        kwargsanchorpath = cls._kwargsanchorpath(root)
+        fs, _ = fsspec.url_to_fs(kwargsanchorpath)
+        if not fs.exists(kwargsanchorpath):
+            df = None
+        else:
+            paths = list(fs.ls(kwargsanchorpath))
+            kwargsfiles_ = list(itertools.chain.from_iterable(
+                fs.ls(path) for path in paths
+            ))
+            kwargsfiles = [f for f in kwargsfiles_ if fs.exists(f) and f.endswith('.parquet')]
+            hashes = [os.path.dirname(f).removeprefix(kwargsanchorpath).removeprefix('/') for f in kwargsfiles]
+            if len(kwargsfiles) > 0:
+                dfs = []
+                for kwargsfile in kwargsfiles:
+                    _df = pd.read_parquet(kwargsfile)
                     dfs.append(_df)
                 df = pd.concat(dfs)
                 df.index = hashes
@@ -857,9 +883,28 @@ class Datablock(Datashard):
 
     def scopes(self):
         return self.Scopes(self.__class__, self.root)
+    
+    def kwargs(self):
+        return self.Kwargs(self.__class__, self.root)
 
     def journal(self):
         return self.Journal(self.__class__, self.root)
+
+    @classmethod
+    def _loganchorpath(cls, root):
+        loganchor = os.path.join(
+            (
+                cls.__module__
+                + "."
+                + cls.__name__
+            ),
+            ".log",
+        )
+        loganchorpath = os.path.join(
+            root,
+            loganchor,
+        )
+        return loganchorpath
 
     @classmethod
     def _scopeanchorpath(cls, root):
@@ -893,45 +938,51 @@ class Datablock(Datashard):
         )
         return kwargsanchorpath
 
-    @classmethod
-    def _scopepath(cls, root, hash, *, ensure: bool = True):
-        scopeanchorpath = cls._scopeanchorpath(root)
-        scopepath = os.path.join(
-            scopeanchorpath,
-            hash,
+    def _logpath(self, *, ensure: bool = True):
+        loganchorpath = self._loganchorpath(self.root)
+        logdirpath = os.path.join(
+            loganchorpath,
+            self.hash,
         )
         if ensure:
-            fs, _ = fsspec.url_to_fs(scopepath)
-            fs.makedirs(scopepath, exist_ok=True)
+            fs, _ = fsspec.url_to_fs(logdirpath)
+            fs.makedirs(logdirpath, exist_ok=True)
+        logpath = os.path.join(logdirpath, f'{self.dt}.log')
+        return logpath
+
+    def _scopepath(self, kind, *, ensure: bool = True):
+        scopeanchorpath = self._scopeanchorpath(self.root)
+        scopedirpath = os.path.join(
+            scopeanchorpath,
+            self.hash,
+        )
+        if ensure:
+            fs, _ = fsspec.url_to_fs(scopedirpath)
+            fs.makedirs(scopedirpath, exist_ok=True)
+        if kind == 'yaml':
+            scopepath = os.path.join(scopedirpath, f'{self.dt}.yaml')
+        elif kind == 'parquet':
+            scopepath = os.path.join(scopedirpath, f'{self.dt}.parquet')
+        else:
+            raise ValueError(f"Unknown path kind: {kind}")
         return scopepath
     
-    @classmethod
-    def _kwargspath(cls, root, hash, *, ensure: bool = True):
-        kwargsanchorpath = cls._kwargsanchorpath(root)
-        kwargspath = os.path.join(
+    def _kwargspath(self, kind, *, ensure: bool = True):
+        kwargsanchorpath = self._kwargsanchorpath(self.root)
+        kwargsdirpath = os.path.join(
             kwargsanchorpath,
-            hash,
+            self.hash,
         )
         if ensure:
-            fs, _ = fsspec.url_to_fs(kwargspath)
-            fs.makedirs(kwargspath, exist_ok=True)
-        return kwargspath
-    
-    @classmethod
-    def Scopepath(cls, root, hash, kind, *, ensure: bool = True):
+            fs, _ = fsspec.url_to_fs(kwargsdirpath)
+            fs.makedirs(kwargsdirpath, exist_ok=True)
         if kind == 'yaml':
-            return os.path.join(cls._scopepath(root, hash, ensure=ensure), 'scope.yaml')
+            kwargspath = os.path.join(kwargsdirpath, f'{self.dt}.yaml')
         elif kind == 'parquet':
-            return os.path.join(cls._scopepath(root, hash, ensure=ensure), 'scope.parquet')
+            kwargspath = os.path.join(kwargsdirpath, f'{self.dt}.parquet')
         else:
-            raise ValueError(f"Unknown configpath kind: {kind}")
-        
-    @classmethod
-    def Kwargspath(cls, root, hash, *, ensure: bool = True):
-        return os.path.join(cls._kwargspath(root, hash, ensure=ensure), 'kwargs.yaml')
-        
-    def logpath(self, *, ensure: bool = True):
-        return os.path.join(self._scopepath(self.root, self.hash, ensure=ensure), 'log', f'{self.uuid}.log')
+            raise ValueError(f"Unknown path kind: {kind}")
+        return kwargspath
 
     @staticmethod
     def _journalanchorpath(cls, root, *, ensure: bool = True):
@@ -967,7 +1018,6 @@ class Datablock(Datashard):
         *,
         ensure: bool = False,
     ):  
-        
         hashpath = self.hashpath()
         if topic is not None:
             assert topic in self.TOPICFILES, f"Topic {repr(topic)} not in {self.TOPICFILES}"
@@ -1012,16 +1062,23 @@ class Datablock(Datashard):
             scope['version'] = self.version
             self._scope = scope
         return self._scope
+    
+    @property
+    def _kwargs_(self):
+        kw = self.__getstate__()
+        kw['hash'] = self.hash
+        kw['datetime'] = self.dt
+        return kw
 
     def _write_scope(self):
         #
-        yscopepath = self.Scopepath(self.root, self.hash, 'yaml')
+        yscopepath = self._scopepath('yaml')
         yfs, _ = fsspec.url_to_fs(yscopepath)
         write_yaml(self._scope_, yscopepath)
         assert yfs.exists(yscopepath), f"scopepath {yscopepath} does not exist after writing"
         self.log.debug(f"WROTE: SCOPE: yaml: {yscopepath}")
         #
-        pscopepath = self.Scopepath(self.root, self.hash, 'parquet')
+        pscopepath = self._scopepath('parquet')
         pfs, _ = fsspec.url_to_fs(pscopepath)
         scopedf = pd.DataFrame.from_records([self._scope_])
         scopedf.to_parquet(pscopepath)
@@ -1031,21 +1088,26 @@ class Datablock(Datashard):
 
     def _write_kwargs(self):
         #
-        kwargspath = self.Kwargspath(self.root, self.hash,)
+        kwargspath = self._kwargspath('yaml')
         kfs, _ = fsspec.url_to_fs(kwargspath)
         write_yaml(self._kwargs_, kwargspath)
         assert kfs.exists(kwargspath), f"kwargspath {kwargspath} does not exist after writing"
         self.log.debug(f"WROTE: KWARGS: yaml: {kwargspath}")
+        #
+        pkwargspath = self._kwargspath('parquet')
+        pfs, _ = fsspec.url_to_fs(pkwargspath)
+        kwargsdf = pd.DataFrame.from_records([{k: repr(v) for k, v in self._kwargs_.items()}])
+        kwargsdf.to_parquet(pkwargspath)
+        assert pfs.exists(pkwargspath), f"kwargspath {pkwargspath} does not exist after writing"
 
     def _write_journal_entry(self, event:str):
         hash = self.hash
-        dt = str(datetime.datetime.now()).replace(' ', '-')
+        dt = self.dt
         key = f"{hash}-{dt}"
 
-        kwargs_path = os.path.join(self._journalanchorpath(self.__class__, self.root), f"{key}.yaml")
-        write_yaml(self._kwargs_, kwargs_path)
+        kwargs_path = self._kwargspath('yaml')
         #
-        logpath = self.logpath()
+        logpath = self._logpath()
         if logpath is not None:
             logfs, _ = fsspec.url_to_fs(logpath)
             has_log = logfs.exists(logpath)
@@ -1086,210 +1148,12 @@ class Datablock(Datashard):
             f.write("")
 
 
-def datablock_method(
-    datablock_cls,
-    method,
-    method_kwargs,
-    *,
-    root: str = None,
-    spec: Optional[Union[str,dict]] = None,
-    anchored: bool = True,
-    hash: Optional[str] = None,
-    tag: Optional[str] = None,
-    verbose: bool = False,
-    debug: bool = False,
-    capture_build_output: bool = False,
-    gitrepo: str  = None,
-    kwargs: dict = dict(),
-):
-    datablock_cls = eval_term(datablock_cls)
-    datablock = datablock_cls(root,
-                              spec=spec, 
-                              anchored=anchored, 
-                              hash=hash,
-                              tag=tag,
-                              verbose=verbose, 
-                              debug=debug, 
-                              capture_build_output=capture_build_output, 
-                              gitrepo=gitrepo,
-                              **kwargs)
-    method_callable = getattr(datablock, method)
-    return method_callable(**method_kwargs)
-
-    
-class DatabatchBuilder:
-    def __init__(self, *, verbose: bool = False, debug: bool = False,):
-        self.verbose = verbose
-        self.debug = debug
-        self.log = Logger(verbose=verbose, debug=debug)
-        
-    def __call__(self, datablock_build_method_args_kwargs_list):
-        N = len(datablock_build_method_args_kwargs_list)
-        for i, (args, kwargs) in enumerate(datablock_build_method_args_kwargs_list):
-            self.log.verbose(f"Building {i}-th datablock out of {N}")
-            datablock_method(*args, **kwargs)
-        
-
-class Databatch(Datablock):
-    DATABLOCK = None
-    TOPICFILE = "summary.csv"
-
-    def __init__(
-        self,
-        root: str = None,
-        spec: Optional[Union[str,dict]] = None,
-        *,
-        anchored: bool = True,
-        hash: Optional[str] = None,
-        verbose: bool = False,
-        debug: bool = False,
-        capture_build_output: bool = False,
-        gitrepo: str  = None,
-        builder: DatabatchBuilder = None,
-    ):
-        super().__init__(root,
-                         spec=spec,
-                         anchored=anchored,
-                         hash=hash,
-                         verbose=verbose,
-                         debug=debug,
-                         capture_build_output=capture_build_output, 
-                         gitrepo=gitrepo)
-        self._builder = builder
-
-    @property
-    def builder(self):
-        if isinstance(self._builder, str):
-            self._builder = eval_term(self._builder)
-        return self._builder
-
-    def datablocks(self) -> typing.Iterable[Datablock]:
-        raise NotImplementedError()
-        return self
-
-    def __build__(self,):
-        if self.builder is None:
-            n_datablocks = len(self.datablocks())
-            if self.verbose or self.debug:
-                iterator = enumerate(self.datablocks())
-            else:
-                iterator = tqdm.tqdm(enumerate(self.datablocks()))
-            for i, datablock in iterator:
-                self.log.verbose(f"Building {i}-th datablock out of {n_datablocks}")
-                datablock.build()
-        else:
-            datablock_method_args_kwargs_list = []
-            for i, datablock in enumerate(self.datablocks()):
-                tagi = f"run:{i}:{self.hash}"
-                datablock_method_args_kwargs = (
-                    (self.DATABLOCK, 'build', {}),
-                    datablock._kwargs_,
-                )
-                datablock_method_args_kwargs_list.append(datablock_method_args_kwargs)
-            self.builder(datablock_method_args_kwargs_list)
-        return self
-
-    def run(self):
-        return self.build()
-    
-    def datablock_scopes(self):
-        return self.Scopes(self.DATABLOCK, self.root)
-
-    def datablock_journal(self):
-        return self.Journal(self.DATABLOCK, self.root)
-
-
-class MultiprocessProgressTracker:
-    """Wrapper for a rich.progress tracker that can be shared across processes."""
-
-    def __init__(self, tasks):
-        ctx = mp.get_context('spawn')
-        self.mp_values = {
-            task.id: ctx.Value('i', task.completed)
-            for task in tasks
-        }
-
-    def advance(self, id, amount):
-        with self.mp_values[id].get_lock():
-            self.mp_values[id].value += amount
-
-    def __getitem__(self, id):
-        return self.mp_values[id].value
-
-
-class MultiprocessProgress:
-    """Wrapper for a rich.progress bar that can be shared across processes."""
-
-    def __init__(self, pb):
-        self.pb = pb
-        self.tracker = MultiprocessProgressTracker(self.pb.tasks)
-        self.should_stop = False
-
-    def _update_progress(self):
-        while not self.should_stop:
-            for task in self.pb.tasks:
-                self.pb.update(task.id, completed=self.tracker[task.id])
-            time.sleep(0.1)
-
-    def __enter__(self):
-        self._thread = threading.Thread(target=self._update_progress)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *args):
-        self.should_stop = True
-        self._thread.join()
-
-
-def datablock_method_multiprocessing(
-        id,
-        datablock_method_args_kwargs_list,
-        progress_bar=None,
-        progress_task=None,
-):
-        args, kwargs = datablock_method_args_kwargs_list[id]
-        result = datablock_method(*args, **kwargs)
-        if progress_bar is not None and progress_task is not None:
-            progress_bar.advance(progress_task, 1)
-        return result
-    
-
 def quote(obj):
     if isinstance(obj, str) and obj.startswith("@"):
         quote = obj
     else:
         quote = f"@{repr(obj)}#"
     return quote
-
-
-
-class TorchMultiprocessingDatabatchBuilder(DatabatchBuilder):
-    def __init__(self, *, num_gpus: int = 1):
-        self.num_gpus = num_gpus
-    
-    def __call__(self, datablock_method_args_kwargs_list):
-        N = len(datablock_method_args_kwargs_list)
-        pb = rich.progress.Progress() 
-        pb.add_task(
-            "Speed: ",
-            progress_type="speed",
-            total=None
-        )
-        slide_task = pb.add_task(
-            f"Building ...",
-            progress_type="slide_progress",
-            total=N,
-        )
-        pb.start()
-        with MultiprocessProgress(pb) as mp_pb:
-            torch.multiprocessing.spawn(
-                datablock_method_multiprocessing,
-                args=(datablock_method_args_kwargs_list,
-                      mp_pb.tracker,
-                      slide_task,
-                ),       
-                nprocs=self.num_gpus,
-            )
 
 
 class TorchMultithreadingDatashardBatchBuilder:
