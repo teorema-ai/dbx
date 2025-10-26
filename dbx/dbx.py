@@ -296,7 +296,7 @@ def read_npz(path, *keys, log=Logger(), debug: bool = False):
     fs, _ = fsspec.url_to_fs(path)
     with fs.open(path, "rb") as f:
         data = np.load(f)
-        results = [data[k] for k in keys]
+        results = {k: data[k] for k in keys}
         log.debug(f"READ {list(keys)} from {path}")
         return results
     
@@ -366,6 +366,12 @@ def make_halton_sampling_kwargs_sequence(N, range_kwargs, *, seed=123, precision
     return kwargs_list
 
 
+class Databag:
+    @property
+    def label(self):
+        raise NotImplementedError()
+
+
 class Datashard:
     def __init__(self):
         self.device = 'cpu'
@@ -425,7 +431,6 @@ class Datablock(Datashard):
         detailed: bool = False,
         capture_build_output: bool = False,
         gitrepo: str  = None,
-        slash_repr: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -441,7 +446,6 @@ class Datablock(Datashard):
             detailed=detailed,
             capture_build_output=capture_build_output,
             gitrepo=gitrepo,
-            slash_repr=slash_repr,
             **kwargs,
         ))
         
@@ -468,8 +472,6 @@ class Datablock(Datashard):
         processed.append('hash')
         self.tag = kwargs.get('tag')
         processed.append('tag')
-        self.slash_repr = kwargs.get('slash_repr')
-        processed.append('slash_repr')
         #
         self.info = eval(os.environ.get('DBXINFO', str(kwargs.get('info'))))
         self.verbose = eval(os.environ.get('DBXVERBOSE', str(kwargs.get('verbose'))))
@@ -523,9 +525,8 @@ class Datablock(Datashard):
             detailed=self.detailed,
             capture_build_output=self.capture_build_output,
             gitrepo=self.gitrepo,
-            slash_repr=self.slash_repr,
             **{k: getattr(self, k) for k in self.parameters 
-             if k not in ('device', 'root', 'spec', 'anchored', 'hash', 'tag', 'slash_repr', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
+             if k not in ('device', 'root', 'spec', 'anchored', 'hash', 'tag', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
             }
         )
     
@@ -558,8 +559,6 @@ class Datablock(Datashard):
         else:
             argskwargsrepr = argstr
         r = f"{self.anchor()}({argskwargsrepr})"
-        if not self.slash_repr:
-            r = r.replace('\\', '')
         self.log.detailed(f"{self.anchor()}: repr: {r}")
         return r
     
@@ -1148,11 +1147,11 @@ class Datablock(Datashard):
             f.write("")
 
 
-def quote(obj):
-    if isinstance(obj, str) and obj.startswith("@"):
+def quote(obj, tag=None):
+    if isinstance(obj, str) and (obj.startswith("@") or obj.startswith("#") or obj.startswith("$")):
         quote = obj
     else:
-        quote = f"@{repr(obj)}#"
+        quote = f"{repr(obj)}"
     return quote
 
 
