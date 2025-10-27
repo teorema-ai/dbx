@@ -367,9 +367,7 @@ def make_halton_sampling_kwargs_sequence(N, range_kwargs, *, seed=123, precision
 
 
 class Databag:
-    @property
-    def label(self):
-        raise NotImplementedError()
+    label = None
 
 
 class Datashard:
@@ -1147,11 +1145,11 @@ class Datablock(Datashard):
             f.write("")
 
 
-def quote(obj, tag=None):
+def quote(obj, tag='$'):
     if isinstance(obj, str) and (obj.startswith("@") or obj.startswith("#") or obj.startswith("$")):
         quote = obj
     else:
-        quote = f"{repr(obj)}"
+        quote = f"{tag}{repr(obj)}"
     return quote
 
 
