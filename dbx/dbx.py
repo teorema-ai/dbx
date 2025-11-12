@@ -1,7 +1,8 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 import copy
 from dataclasses import dataclass, fields, asdict, replace, is_dataclass
 import datetime
+import functools
 import gc
 import hashlib
 import importlib
@@ -11,6 +12,7 @@ import json
 import multiprocessing as mp
 import os
 import pickle
+import pprint
 import queue
 import sys
 import threading
@@ -18,6 +20,7 @@ import traceback as tb
 from typing import Union, Optional, Sequence
 import uuid
 import yaml
+
 
 import git
 
@@ -51,6 +54,7 @@ class Logger:
 
     def __init__(
         self,
+        name: Optional[str] = None,
         *,
         warning: bool = True,
         info: bool = True,
@@ -58,7 +62,6 @@ class Logger:
         debug: bool = False,
         select: bool = False,
         detailed: bool = False,
-        name: Optional[str] = None,
         datetime: bool = True,
         stack_depth: int = 2,
     ):
@@ -68,17 +71,7 @@ class Logger:
         self._select = eval(os.environ.get('DBXLOGSELECT', str(select)))
         self._debug = eval(os.environ.get('DBXLOGDEBUG', str(debug)))
         self._detailed = eval(os.environ.get('DBXLOGDETAILED', str(detailed)))
-        '''
-        #DEBUG
-        print(f"DBXLOGWARNING: {os.environ.get('DBXLOGWARNING')}, "
-              f"DBXLOGINFO: {os.environ.get('DBXLOGINFO')}, "
-              f"DBXLOGVERBOSE: {os.environ.get('DBXLOGVERBOSE')}, "
-              f"DBXLOGSELECT: {os.environ.get('DBXLOGSELECT')}, "
-              f"DBXLOGDEBUG: {os.environ.get('DBXLOGDEBUG')}, "
-              f"DBXLOGDETAILED: {os.environ.get('DBXLOGDETAILED')}"
-        )
-        print(f"{self._warning=}, {self._info=}, {self._verbose=}, {self._select=}, {self._debug=}, {self._detailed=}")
-        '''
+        
         self.allowed = ["ERROR"]
         if self._warning:
             self.allowed.append("WARNING")
@@ -91,10 +84,13 @@ class Logger:
         if self._select:
             self.allowed.append("SELECT")
         if self._detailed:
-            self.allowed.append("DETAIL")
+            self.allowed.append("DETAILED")
         self.stack_depth = stack_depth
         self.name = name
         self.datetime = datetime
+
+    def get(self, key):
+        return getattr(self, "_"+key)
 
     def _print(self, prefix, msg):
         if self.name is None:
@@ -133,25 +129,48 @@ class Logger:
         pass
 
 
+class Tee:
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+            f.flush() # Ensure immediate writing
+
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+
 class JournalEntry(pd.Series):
     def __init__(self, series: pd.Series):
         super().__init__(series)
 
-    def _read(self, thing):
-        if hasattr(self, thing) and getattr(self, thing) is not None:
-            result = read_yaml(getattr(self, thing))
-        else:
+    def read(self, *things):
+        def read_thing(thing):
+            if hasattr(self, thing) and getattr(self, thing) is not None:
+                path = getattr(self, thing)
+                _, _ext = os.path.splitext(path)
+                ext = _ext[1:]
+                if ext == 'yaml':
+                    result = read_yaml(getattr(self, thing))
+                elif ext == 'txt' or ext == 'log':
+                    result = read_str(getattr(self, thing))
+                else:
+                    raise ValueError(f"Uknown journal entry field extention for {thing}: {ext}")
+            else:
+                result = None
+            return result
+        if len(things) == 0:
             result = None
+        elif len(things) == 1:
+            result = read_thing(things[0])
+        else:
+            result = {thing: read_thing(thing) for thing in things}
         return result
+
     
-    def read_scope(self):
-        return self._read('kwargs')
-    
-    def read_kwargs(self):
-        return self._read('scope')
-
-
-
 def gitrevision(repopath, *, log=Logger()):
     if repopath is not None:
         repo = git.Repo(repopath)
@@ -160,13 +179,13 @@ def gitrevision(repopath, *, log=Logger()):
         branch = repo.active_branch.name
         reponame = os.path.basename(repopath)
         revision = f"{reponame}:{repo.rev_parse(branch).hexsha}"
-        log.verbose(f"Obtained git revision for git repo {repopath}: {revision}")
+        log.debug(f"Obtained git revision for git repo {repopath}: {revision}")
     else:
         revision = None
     return revision
 
 
-def make_download_url(path):
+def make_google_cloud_storage_download_url(path):
     if not path.startswith("gs://"):
         return None
     _path = path.removeprefix("gs://")
@@ -219,6 +238,7 @@ def eval_term(name):
             argkwargstr = name[lb + 1 : rb]
         return funcstr, argkwargstr
 
+    Logger("eval_term").detailed(f" ====================> Evaluating term {repr(name)}")
     if isinstance(name, Iterable) and not isinstance(name, str):
         term = [eval_term(item) for item in name]
     elif isinstance(name, str):
@@ -252,7 +272,22 @@ def exec(s=None):
 
 
 def exec_print(argstr=None):
-    print(exec(argstr))
+    pprint.pprint(exec(argstr))
+
+
+def write_str(text, path, *, log=Logger(), debug: bool = False):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, "w") as f:
+        f.write(text)
+        log.debug(f"WROTE {path}")
+
+
+def read_str(path, *, log=Logger(), debug: bool = False):
+    fs, _ = fsspec.url_to_fs(path)
+    with fs.open(path, "r") as f:
+        text = f.read()
+        log.debug(f"READ {path}")
+    return text
 
 
 def write_yaml(data, path, *, log=Logger(), debug: bool = False):
@@ -436,7 +471,7 @@ class Datablock:
         verbose: bool = False,
         debug: bool = False,
         detailed: bool = False,
-        capture_build_output: bool = False,
+        capture_output: bool = False,
         gitrepo: str  = None,
         **kwargs,
     ):
@@ -451,7 +486,7 @@ class Datablock:
             verbose=verbose,
             debug=debug,
             detailed=detailed,
-            capture_build_output=capture_build_output,
+            capture_output=capture_output,
             gitrepo=gitrepo,
             **kwargs,
         ))
@@ -480,33 +515,29 @@ class Datablock:
         self.tag = kwargs.get('tag')
         processed.append('tag')
         #
-        self.info = eval(os.environ.get('DBXINFO', str(kwargs.get('info'))))
-        self.verbose = eval(os.environ.get('DBXVERBOSE', str(kwargs.get('verbose'))))
-        self.debug = eval(os.environ.get('DBXDEBUG', str(kwargs.get('debug'))))
-        self.detailed = eval(os.environ.get('DBXDETAILED', str(kwargs.get('detailed'))))
-        self.gitrepo = os.environ.get('DBXREPO', kwargs.get('gitrepo'))
-        self.capture_build_output = bool(kwargs.get('capture_build_output'))
-        processed.extend(['verbose', 'debug', 'gitrepo', 'capture_build_output'])  
         self.log = Logger(
-            debug=self.debug,
-            verbose=self.verbose,
-            detailed=self.detailed,
-            info=self.info,
-            name=self.anchor(),
+            name=f"{self.anchor()}",
+            debug=kwargs.get('debug'),
+            verbose=kwargs.get('verbose'),
+            detailed=kwargs.get('detailed'),
+            info=kwargs.get('info'),
         )
+        self.info = self.log.get('info')
+        self.verbose = self.log.get('verbose')
+        self.debug = self.log.get('debug')
+        self.detailed = self.log.get('detailed')
+        #
+        self.gitrepo = os.environ.get('DBXREPO', kwargs.get('gitrepo'))
+        self.capture_output = bool(kwargs.get('capture_output'))
+        processed.extend(['verbose', 'debug', 'gitrepo', 'capture_output'])  
         #
         if isinstance(self.spec, str):
             self.spec = read_json(self.spec, debug=self.debug)
         if self.spec is None:
-            if self._hash is None:
-                self.spec = asdict(self.CONFIG())
-            else:
-                self.spec = ModuleNotFoundError
-        if self._hash is None:
-            self.config = self._spec_to_config(self.spec)
-        else:
-            self.config = None
-        self.cfg = self.config
+            self.spec = asdict(self.CONFIG())
+        self.cfg = self._spec_to_cfg(self.spec)
+        self.config = self.cfg # alias
+        #
         self._spec = None
         self._scope = None
         self._autohash = self._hash is None
@@ -517,6 +548,24 @@ class Datablock:
         self.parameters = list(kwargs.keys())
         self.dt = datetime.datetime.now().isoformat().replace(' ', '-').replace(':', '-')
         self.__post_init__()
+        # redefined the logger using self.hash, which is generally invalid before __post_init__ (e.g., TOPICFILES may be undefined)
+        self.log = Logger(
+            name=f"{self.anchor()}/{self.hash}",
+            debug=kwargs.get('debug'),
+            verbose=kwargs.get('verbose'),
+            detailed=kwargs.get('detailed'),
+            info=kwargs.get('info'),
+        )
+        self.log.detailed(f"======--------------> spec: {self.spec}")
+        self.log.detailed(f"======--------------> _quote_: {self._quote_}")
+        self.log.detailed(f"======--------------> _eta_: {self._eta_}")
+        self.log.detailed(f"======--------------> _scope_: {self._scope_}")
+        self.log.detailed(f"======--------------> _kwargs_: {self._kwargs_}")
+        self.log.detailed(f"======--------------> _hivehandle_: {self._hivehandle_}")
+        self.log.detailed(f"======--------------> hash: {self.hash}")
+        self.log.detailed(f"======--------------> __repr__(): {self.__repr__()}")
+        
+        
 
     def __getstate__(self):
         return dict(
@@ -530,10 +579,10 @@ class Datablock:
             verbose=self.verbose,
             debug=self.debug,
             detailed=self.detailed,
-            capture_build_output=self.capture_build_output,
+            capture_output=self.capture_output,
             gitrepo=self.gitrepo,
             **{k: getattr(self, k) for k in self.parameters 
-             if k not in ('device', 'root', 'spec', 'anchored', 'hash', 'tag', 'info', 'verbose', 'debug', 'detailed', 'capture_build_output', 'gitrepo')
+             if k not in ('device', 'root', 'spec', 'anchored', 'hash', 'tag', 'info', 'verbose', 'debug', 'detailed', 'capture_output', 'gitrepo')
             }
         )
     
@@ -551,99 +600,7 @@ class Datablock:
 
     def __post_init__(self):
         ...
-
-    def __repr__(self):
-        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
-        # computed using the older version of __repr__().
-        if self._autoroot:
-            argstr = f"spec={repr(self._spec_)}"
-        else:
-            argstr = ', '.join((repr(self.root), f"spec={self._spec_}"))
-        kwargslist = []
-        if not self.anchored:
-            kwargslist.append('anchored=False')
-        if not self._autohash:
-            kwargslist.append(f'hash={self._hash}')
-        if len(kwargslist) > 0:
-            kwargstr = ', '.join(kwargslist)
-            argskwargsrepr = argstr + ', ' + kwargstr
-        else:
-            argskwargsrepr = argstr
-        r = f"{self.anchor()}({argskwargsrepr})"
-        self.log.detailed(f"{self.anchor()}: repr: {r}")
-        return r
     
-    def __str__(self):
-        r = self.__repr__()
-        r = r.replace('\\', '')
-        return r
-    
-    @property
-    def version(self):
-        if hasattr(self, 'VERSION'):
-            version = self.VERSION
-        else:
-            version = None
-        return version
-    
-    @property
-    def uuid(self):
-        if not hasattr(self, '_uuid'):
-            self._uuid = str(uuid.uuid4())
-        return self._uuid
-
-    def filepath(
-        self,
-        dirpath,
-        topicfile=None,
-    ):
-        if topicfile is None:
-            path = None
-        else:
-            path = os.path.join(dirpath, topicfile) if topicfile is not None else None     
-        return path
-    
-    def path(
-        self,
-        topic=None,
-        *,
-        ensure_dirpath: bool = False,
-    ):
-        if topic is None:
-            dirpath = self.dirpath()
-            topicfiles = self.TOPICFILE
-        else:
-            dirpath = self.dirpath(topic)
-            topicfiles = self.TOPICFILES[topic]
-        if ensure_dirpath and dirpath is not None:
-            self.ensure_path(dirpath)
-        if isinstance(topicfiles, dict): 
-            path = {topic: self.filepath(dirpath, topicfile) for topic, topicfile in topicfiles.items()}
-        elif isinstance(topicfiles, list):
-            path = [self.filepath(dirpath, topicfile) for topicfile in topicfiles]
-        elif isinstance(topicfiles, str):
-            path = self.filepath(dirpath, topicfiles)
-        else:
-            path = None
-        self.log.detailed(f"{self.anchor()}: path: {path}")
-        return path
-
-    def ensure_path(self, path):
-        fs, _ = fsspec.url_to_fs(path)
-        fs.makedirs(path, exist_ok=True)
-        return self
-
-    def url(self, topic=None, *, redirect=None):
-        path = self.path(topic)
-        return make_download_url(path)
-    
-    def paths(self):
-        if self.has_topics:
-            paths = {topic: self.path(topic) for topic in self.topics()}
-        else:
-            paths = self.path()
-        return paths
-
     def validpath(self, path):
         if isinstance(path, dict):
             return all([self.validpath(p) for p in path.values()])
@@ -683,28 +640,38 @@ class Datablock:
     
     def has_topic(self):
         return hasattr(self, "TOPICFILE")
+    
+    @property
+    def autoroot(self):
+        return self._autoroot
 
     def build(self, *args, **kwargs):
-        if self.capture_build_output:
+        if self.capture_output:
             stdout = sys.stdout
             logpath = self._logpath()
             outfs, _ = fsspec.url_to_fs(logpath)
             captured_stdout_stream = outfs.open(logpath, "w", encoding="utf-8")
-            sys.stdout = captured_stdout_stream
+            sys.stdout = Tee(stdout, captured_stdout_stream)
         try:
             if not self.valid():
                 self.__pre_build__(*args, **kwargs).__build__(*args, **kwargs).__post_build__(*args, **kwargs)
             else:
                 self.log.verbose(f"Skipping existing datablock: {self.hashpath()}")
         finally:
-            if self.capture_build_output:
+            if self.capture_output:
                 sys.stdout = stdout
                 captured_stdout_stream.close()
         return self
 
     def __pre_build__(self, *args, **kwargs):
-        self._write_scope()
-        self._write_kwargs()
+        self._write_kwargs()#TODO: REFACTOR thru _write_journal_dict
+        self._write_journal_dict('spec', self.spec)
+        self._write_scope() #TODO: REFACTOR thru _write_journal_dict
+        self._write_str('quote', self._quote_)
+        self._write_str('eta', self._eta_)
+        self._write_str('hivehandle', self._hivehandle_)
+        self._write_str('repr', self.__repr__())
+
         self._write_journal_entry(event="build:start",)
         return self
 
@@ -714,12 +681,6 @@ class Datablock:
     def __post_build__(self, *args, **kwargs):
         self._write_journal_entry(event="build:end",)
         return self
-    
-    @property
-    def revision(self):
-        if not hasattr(self, '_revision'):
-            self._revision = gitrevision(self.gitrepo, log=self.log) if self.gitrepo is not None else None
-        return self._revision
 
     def leave_breadcrumbs(self):
         if hasattr(self, "TOPICFILES"):
@@ -811,7 +772,103 @@ class Datablock:
         self.log.verbose(f"Copying files from {hashpath}: END")
         assert self.valid(), f"Invalid Datablock after copy: {self}"
 
+    def _spec_to_cfg(self, spec):
+        config = self.CONFIG(**spec)
+        replacements = {}
+        for field in fields(config):
+            term = getattr(config, field.name)
+            if issubclass(self.CONFIG, Datablock.CONFIG):
+                getter = Datablock.CONFIG.LazyLoader(term)
+            else:
+                getter = eval_term(term)
+            replacements[field.name] = getter
+        config = replace(config, **replacements)
+        self.log.detailed(f"Made {config=} from {spec=}")
+        return config
+
+    def leave_breadcrumbs_at_path(self, path):
+        fs, _ = fsspec.url_to_fs(path)
+        with fs.open(path, "w") as f:
+            f.write("")
     
+    #PATHS: BEGIN
+    def path(
+        self,
+        topic=None,
+        *,
+        ensure_dirpath: bool = False,
+    ):
+        if topic is None:
+            dirpath = self.dirpath()
+            topicfiles = self.TOPICFILE
+        else:
+            dirpath = self.dirpath(topic)
+            topicfiles = self.TOPICFILES[topic]
+        if ensure_dirpath and dirpath is not None:
+            self.ensure_path(dirpath)
+        if isinstance(topicfiles, dict): 
+            path = {topic: self.filepath(dirpath, topicfile) for topic, topicfile in topicfiles.items()}
+        elif isinstance(topicfiles, list):
+            path = [self.filepath(dirpath, topicfile) for topicfile in topicfiles]
+        elif isinstance(topicfiles, str):
+            path = self.filepath(dirpath, topicfiles)
+        else:
+            path = None
+        self.log.detailed(f"{self.anchor()}: path: {path}")
+        return path
+    
+    def dirpath(
+        self,
+        topic=None,
+        *,
+        ensure: bool = False,
+    ):  
+        hashpath = self.hashpath()
+        if topic is not None:
+            assert topic in self.TOPICFILES, f"Topic {repr(topic)} not in {self.TOPICFILES}"
+            dirpath = os.path.join(hashpath, topic)
+        else:
+            dirpath = hashpath
+        if ensure:
+            fs, _ = fsspec.url_to_fs(dirpath)
+            fs.makedirs(dirpath, exist_ok=True)
+        return dirpath
+    
+    def filepath(
+        self,
+        dirpath,
+        topicfile=None,
+    ):
+        if topicfile is None:
+            path = None
+        else:
+            path = os.path.join(dirpath, topicfile) if topicfile is not None else None     
+        return path
+    
+    def hashpath(self, *, ensure: bool = True):
+        anchorpath = self.anchorpath()
+        hashpath = os.path.join(anchorpath, self.hash)
+        if ensure:
+            fs, _ = fsspec.url_to_fs(hashpath)
+            fs.makedirs(hashpath, exist_ok=True)
+        return hashpath
+
+    def ensure_path(self, path):
+        fs, _ = fsspec.url_to_fs(path)
+        fs.makedirs(path, exist_ok=True)
+        return self
+
+    def url(self, topic=None, *, redirect=None):
+        path = self.path(topic)
+        return make_google_cloud_storage_download_url(path)
+    
+    def paths(self):
+        if self.has_topics:
+            paths = {topic: self.path(topic) for topic in self.topics()}
+        else:
+            paths = self.path()
+        return paths
+
     def anchor(self):
         anchor = (
             self.__module__
@@ -826,121 +883,41 @@ class Datablock:
             self.anchor(),
         ) if self.anchored else self.root
         return anchorpath
+
+    @classmethod
+    def _xanchorpath(cls, root, x, *, ensure: bool = False):
+        xanchor = os.path.join(
+            (
+                cls.__module__
+                + "."
+                + cls.__name__
+            ),
+            f".{x}",
+        )
+        xanchorpath = os.path.join(
+            root,
+            xanchor,
+        )
+        if ensure:
+            fs, _ = fsspec.url_to_fs(xanchorpath)
+            fs.makedirs(xanchorpath, exist_ok=True)
+        return xanchorpath
     
-    @property
-    def hash(self):
-        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
-        # computed with the older code.
-        if self._hash is None:
-            if hasattr(self, "TOPICFILES"):
-                topics = [f"_topic_{topic}={file}" for topic, file in self.TOPICFILES.items()]
-            else:
-                topics = ["None"]
-            hivehandle = os.path.join(
-                *topics,
-                *[f"{key}={val}" for key, val in self._scope_.items()]
-            )
-            sha = hashlib.sha256()
-            sha.update(hivehandle.encode())
-            self._hash = sha.hexdigest()
-        return self._hash
+    def _xpath(self, x, ext=None, *, ensure: bool = True):
+        xanchorpath = self._xanchorpath(self.root, x)
+        xhashpath = os.path.join(
+            xanchorpath,
+            self.hash,
+        )
+        if ensure:
+            fs, _ = fsspec.url_to_fs(xhashpath)
+            fs.makedirs(xhashpath, exist_ok=True)
+        if ext is None:
+            ext = x
+        xpath = os.path.join(xhashpath, f'{self.dt}.{ext}')
+        return xpath
     
-    @staticmethod
-    def Scopes(cls, root):
-        cls = eval_term(cls)
-        if root is None:
-            root = os.environ.get('DBXROOT')
-        scopeanchorpath = cls._scopeanchorpath(root)
-        fs, _ = fsspec.url_to_fs(scopeanchorpath)
-        if not fs.exists(scopeanchorpath):
-            df = None
-        else:
-            paths = list(fs.ls(scopeanchorpath))
-            scopefiles_ = list(itertools.chain.from_iterable(
-                fs.ls(path) for path in paths
-            ))
-            scopefiles = [f for f in scopefiles_ if fs.exists(f) and f.endswith('.parquet')]
-            hashes = [os.path.dirname(f).removeprefix(scopeanchorpath).removeprefix('/') for f in scopefiles]
-            if len(scopefiles) > 0:
-                dfs = []
-                for scopefile in scopefiles:
-                    _df = pd.read_parquet(scopefile)
-                    dfs.append(_df)
-                df = pd.concat(dfs)
-                df.index = hashes
-            else:
-                df = pd.DataFrame(index=hashes)
-            df = df.reset_index().rename(columns={'index': 'hash'})
-        return df
-
-    @staticmethod
-    def Kwargs(cls, root):
-        cls = eval_term(cls)
-        if root is None:
-            root = os.environ.get('DBXROOT')
-        kwargsanchorpath = cls._kwargsanchorpath(root)
-        fs, _ = fsspec.url_to_fs(kwargsanchorpath)
-        if not fs.exists(kwargsanchorpath):
-            df = None
-        else:
-            paths = list(fs.ls(kwargsanchorpath))
-            kwargsfiles_ = list(itertools.chain.from_iterable(
-                fs.ls(path) for path in paths
-            ))
-            kwargsfiles = [f for f in kwargsfiles_ if fs.exists(f) and f.endswith('.parquet')]
-            hashes = [os.path.dirname(f).removeprefix(kwargsanchorpath).removeprefix('/') for f in kwargsfiles]
-            if len(kwargsfiles) > 0:
-                dfs = []
-                for kwargsfile in kwargsfiles:
-                    _df = pd.read_parquet(kwargsfile)
-                    dfs.append(_df)
-                df = pd.concat(dfs)
-                df.index = hashes
-            else:
-                df = pd.DataFrame(index=hashes)
-            df = df.reset_index().rename(columns={'index': 'hash'})
-        return df
-
-    @staticmethod
-    def Journal(cls, entry: int = None, *, root=None):
-        if root is None:
-            root = os.environ.get('DBXROOT')
-        journaldirpath = Datablock._journalanchorpath(eval_term(cls), root)
-        fs, _ = fsspec.url_to_fs(journaldirpath)
-        files = list(fs.ls(journaldirpath))
-        parquet_files = [f for f in files if f.endswith('.parquet')]
-
-        log = Logger()
-        log.debug(f"READING JOURNAL: from {journaldirpath=}, files: {parquet_files}")
-        if len(parquet_files) > 0:
-            dfs = []
-            for file in parquet_files:
-                _df = pd.read_parquet(file)
-                if 'revision' not in _df.columns:
-                    _df = _df.rename(columns={'version': 'revision',})
-                dfs.append(_df)
-            df = pd.concat(dfs)
-            # TODO: FIX uuid; currently not unique
-            columns = ['hash', 'datetime'] + [c for c in df.columns if c not in ('hash', 'datetime', 'event', 'uuid')] + ['event']
-            df = df.sort_values('datetime', ascending=False)[columns].reset_index(drop=True)
-            df = df.rename(columns={'build_log': 'log'})
-        else:
-            df = None
-        if entry is not None:
-            result = JournalEntry(df.loc[entry])
-        else:
-            result = df
-        return result
-
-    def scopes(self):
-        return self.Scopes(self.__class__, self.root)
-    
-    def kwargs(self):
-        return self.Kwargs(self.__class__, self.root)
-
-    def journal(self, entry: int = None):
-        return self.Journal(self.__class__, entry, root=self.root)
-
+    ##REFACTOR: through _xanchorpath/_xpath: BEGIN
     @classmethod
     def _loganchorpath(cls, root):
         loganchor = os.path.join(
@@ -1057,73 +1034,213 @@ class Datablock:
             fs, _ = fsspec.url_to_fs(journalanchorpath)
             fs.makedirs(journalanchorpath, exist_ok=True)
         return journalanchorpath
+    ##REFACTOR: through _xanchorpath/_xpath: END
 
-    def hashpath(self, *, ensure: bool = True):
-        anchorpath = self.anchorpath()
-        hashpath = os.path.join(anchorpath, self.hash)
-        if ensure:
-            fs, _ = fsspec.url_to_fs(hashpath)
-            fs.makedirs(hashpath, exist_ok=True)
-        return hashpath
+    #PATHS: END
 
-    def dirpath(
-        self,
-        topic=None,
-        *,
-        ensure: bool = False,
-    ):  
-        hashpath = self.hashpath()
-        if topic is not None:
-            assert topic in self.TOPICFILES, f"Topic {repr(topic)} not in {self.TOPICFILES}"
-            dirpath = os.path.join(hashpath, topic)
+    #IDENTIFICATION: BEGIN
+    #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
+    # computed using the older version of these methods
+    """
+    . spec:
+			. a specline is a str starting with '@', '$' or '#'
+			. a strline: a non-specline str
+			. an objline: a non-str object
+    """
+    @staticmethod
+    def is_specline(s):
+        return isinstance(s, str) and (
+            s.startswith('@') or s.startswith('$') or s.startswith('#')
+        )
+    
+    @property
+    def version(self):
+        if hasattr(self, 'VERSION'):
+            version = self.VERSION
         else:
-            dirpath = hashpath
-        if ensure:
-            fs, _ = fsspec.url_to_fs(dirpath)
-            fs.makedirs(dirpath, exist_ok=True)
-        return dirpath
-
+            version = None
+        return version
+    
     @property
-    def _spec_(self):
-        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
-        # computed using the older version of _spec_
-        if self._spec is None:
-            _spec = {}
-            for k, v in self.spec.items():
-                value = getattr(self.config, k)
-                if isinstance(v, str) and isinstance(value, Datablock):
-                    if v.startswith('@'):
-                        _spec[k] = v
-                    elif v.startswith('#'):
-                        _spec[k] = f"@{value.anchor()}/{value.hash}"
-                    elif v.startswith('$'):
-                        _spec[k] = repr(value)
-                elif is_dataclass(v):
-                    _spec[k] = asdict(v) #TODO: call to a TBD recursive _scope_ on the container?
-                elif not isinstance(v, str):
-                    _spec[k] = repr(v)
-                else:
-                    _spec[k] = v
-            self._spec = _spec
-        return self._spec
-
+    def uuid(self):
+        if not hasattr(self, '_uuid'):
+            self._uuid = str(uuid.uuid4())
+        return self._uuid
+    
     @property
+    def revision(self):
+        if not hasattr(self, '_revision'):
+            self._revision = gitrevision(self.gitrepo, log=self.log) if self.gitrepo is not None else None
+        return self._revision
+
+    @functools.cached_property
     def _scope_(self):
-        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
-        # computed using the older version of _scope_()
-        if self._scope is None:
-            scope = copy.deepcopy(self._spec_)
-            scope['version'] = self.version
-            self._scope = scope
-        return self._scope
+        """
+        . PARTIALLY reduced spec+version:
+            . #-REDUCED speclines: 
+            . +strlines
+            . +repred objlines
+            . +version
+
+        """
+        _scope = {'version': self.version, 'dt': self.dt}
+        for k, v in self.spec.items():
+            value = getattr(self.cfg, k)
+            if self.is_specline(v):
+                if isinstance(value, Datablock):
+                    _scope[k] = f"#{value.anchor()}/{value.hash}"
+                else:
+                    _scope[k] = v
+            else:
+                _scope[k] = repr(value)
+        return _scope
+    
+    def __rspec__(self, quote: bool = False):
+        """
+            qrspec if quote else frspec:
+            qrspec:
+                . UNREDUCED spec:
+                    . speclines
+                    . strlines
+                    . +quoted Datablock objlines
+                    . +repred non-Datablock objlines
+            frspec:
+                .FULLY REDUCED spec:
+                    . $-repred fully reduced Datablock speclines
+                    . non-reduced non-Datablock speclines
+                    . strlines
+                    . +repred objlines
+        """
+        _spec = {}
+        eta = not quote
+        if quote:
+            for k, v in self.spec.items():
+                value = getattr(self.cfg, k)
+                if isinstance(v, str):
+                    _spec[k] = v
+                elif isinstance(value, Datablock):
+                    _spec[k] = value._quote_
+                else:
+                    _spec[k] = repr(v)
+        if eta:
+            #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
+            # computed using the older version of these methods
+            for k, v in self.spec.items():
+                value = getattr(self.cfg, k)
+                if isinstance(value, str):
+                    _spec[k] = value
+                elif isinstance(value, Datablock):
+                    _spec[k] = value._eta_
+                elif self.is_specline(v):
+                    _spec[k] = v
+                else:
+                    _spec[k] = repr(value)
+        return _spec
+    
+    @functools.cached_property
+    def _rootkwargs_(self):
+        rootkwargs = {}
+        if not self._autoroot:
+            rootkwargs['root'] = self.root
+        if not self.anchored:
+            rootkwargs['anchored'] = False
+        if not self._autohash:
+            rootkwargs['hash'] = self._hash
+        return rootkwargs
+    
+    @functools.cached_property
+    def _rtkwargs_(self):
+        rtkwargs = {
+            k: v
+            for k, v in self.__getstate__().items()
+            if k not in ['root', 'anchored', 'hash', 'spec']          
+        }
+        return rtkwargs
+    
+    def __reprkwargs__(self, _kwargs):
+        def cite(x):
+            return repr(x) if isinstance(x, str) else x
+
+        kwargstrs = [f"{k}={cite(v)}" for k, v in _kwargs.items()]
+        kwargsrepr = ', '.join(kwargstrs)
+        return f"{self.anchor()}({kwargsrepr})"
+    
+    @property
+    def _eta_(self):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
+        # computed using the older version of these methods
+        rspec = self.__rspec__(quote=False)
+        r = "$" + self.__reprkwargs__({
+            **self._rootkwargs_,
+            **{'spec': rspec},
+        })
+        self.log.detailed(f"_eta_: ------------> {rspec=}")
+        return r
+    
+    @property
+    def _quote_(self):
+        _r = self.__reprkwargs__({
+            **self._rootkwargs_,
+            **{'spec': self.__rspec__(quote=True)},
+        })
+        r = f"${_r}"
+        return r
+    
+    def __repr__(self):
+        rspec = self.__rspec__(quote=False)
+        r = self.__reprkwargs__({
+            **self._rootkwargs_,
+            **{'spec': rspec},
+            **self._rtkwargs_,
+        })
+        self.log.detailed(f"__repr__(): ------------> {rspec=}")
+        return r
+    
+    def __str__(self):
+        r = self.__repr__()
+        r = r.replace('\\', '')
+        return r
     
     @property
     def _kwargs_(self):
-        kw = self.__getstate__()
-        kw['hash'] = self.hash
-        kw['datetime'] = self.dt
-        return kw
+        _kwargs_ = self.__getstate__()
+        _kwargs_['datetime'] = self.dt
+        if 'hash' not in _kwargs_:
+            _kwargs_['hash'] = self.hash
+        return _kwargs_
+    
+    @property
+    def _hivehandle_(self):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
+        # computed using the older version of these methods
+        if hasattr(self, "TOPICFILES"):
+            topics = [f"topic:{topic}={file}" for topic, file in self.TOPICFILES.items()]
+        else:
+            topics = ["topics:None"]
+        hivehandle = os.path.join(
+            self._eta_,
+            f"version={self.version}",
+            *topics,
+        )
+        return hivehandle
+    
+    @property
+    def hash(self): 
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hash
+        # computed with the older code.
+        if self._hash is None: 
+            sha = hashlib.sha256()
+            sha.update(self._hivehandle_.encode())
+            _hash = sha.hexdigest()
+            self.log.detailed(f"hash(): ---------===---------> _hivehandle_: {self._hivehandle_} ---> hash: {self._hash}")
+        else:
+            _hash = self._hash
+        return _hash
+    #IDENTIFICATION: END
 
+    #JOURNAL: BEGIN
+
+    ##REFACTOR: thru _write_journal_dict: BEGIN
     def _write_scope(self):
         #
         yscopepath = self._scopepath('yaml')
@@ -1153,14 +1270,43 @@ class Datablock:
         kwargsdf = pd.DataFrame.from_records([{k: repr(v) for k, v in self._kwargs_.items()}])
         kwargsdf.to_parquet(pkwargspath)
         assert pfs.exists(pkwargspath), f"kwargspath {pkwargspath} does not exist after writing"
-    
+    ##REFACTOR: thru _write_journal_dict: END
+
+    def _write_journal_dict(self, name, data):
+        #
+        ypath = self._xpath(name, 'yaml')
+        yfs, _ = fsspec.url_to_fs(ypath)
+        write_yaml(data, ypath)
+        assert yfs.exists(ypath), f"path {ypath} does not exist after writing"
+        self.log.debug(f"WROTE: {name.upper()}: yaml: {ypath}")
+        #
+        pqpath = self._xpath(name, 'parquet')
+        pqfs, _ = fsspec.url_to_fs(pqpath)
+        df = pd.DataFrame.from_records([{k: repr(v) for k, v in data.items()}])
+        df.to_parquet(pqpath)
+        assert pqfs.exists(pqpath), f"pqpath {pqpath} does not exist after writing"
+        self.log.debug(f"WROTE: {name.upper()}: parquet: {pqpath}")
+
+    def _write_str(self, name, text):
+        #
+        path = self._xpath(name, 'txt')
+        fs, _ = fsspec.url_to_fs(path)
+        write_str(text, path)
+        assert fs.exists(path), f"scopepath {path} does not exist after writing"
+        self.log.debug(f"WROTE: {name.upper()}: txt: {path}")
+
     def _write_journal_entry(self, event:str):
         hash = self.hash
         dt = self.dt
         key = f"{hash}-{dt}"
 
+        spec_path = self._xpath('spec', 'yaml')
         kwargs_path = self._kwargspath('yaml')
         scope_path = self._scopepath('yaml')
+        quote_path = self._xpath('quote', 'txt')
+        eta_path = self._xpath('eta', 'txt')
+        hivehandle_path = self._xpath('hivehandle', 'txt')
+        repr_path = self._xpath('repr', 'txt')
         #
         logpath = self._logpath()
         if logpath is not None:
@@ -1178,52 +1324,135 @@ class Datablock:
                                          'log': logpath if has_log else None,
                                          'event': event,
                                          'kwargs': kwargs_path,
+                                         'spec': spec_path,
                                          'scope': scope_path,
+                                         'quote': quote_path,
+                                         'eta': eta_path,
+                                         'hivehandle': hivehandle_path,
+                                         'repr': repr_path,
         }])
         df.to_parquet(journal_path)
         
         tagstr = "with tag {repr(self.tag)} " if self.tag is not None else ""
         self.log.debug(f"WROTE JOURNAL entry for event {repr(event)} {tagstr}"
                          f"to journal_path {journal_path} and kwargs_path {kwargs_path}")
-    
-    def _spec_to_config(self, spec):
-        config = self.CONFIG(**spec)
-        replacements = {}
-        for field in fields(config):
-            term = getattr(config, field.name)
-            if issubclass(self.CONFIG, Datablock.CONFIG):
-                getter = Datablock.CONFIG.LazyLoader(term)
+
+    @staticmethod
+    def Scopes(cls, root):
+        cls = eval_term(cls)
+        if root is None:
+            root = os.environ.get('DBXROOT')
+        scopeanchorpath = cls._scopeanchorpath(root)
+        fs, _ = fsspec.url_to_fs(scopeanchorpath)
+        if not fs.exists(scopeanchorpath):
+            df = None
+        else:
+            paths = list(fs.ls(scopeanchorpath))
+            scopefiles_ = list(itertools.chain.from_iterable(
+                fs.ls(path) for path in paths
+            ))
+            scopefiles = [f for f in scopefiles_ if fs.exists(f) and f.endswith('.parquet')]
+            hashes = [os.path.dirname(f).removeprefix(scopeanchorpath).removeprefix('/') for f in scopefiles]
+            if len(scopefiles) > 0:
+                dfs = []
+                for scopefile in scopefiles:
+                    _df = pd.read_parquet(scopefile)
+                    dfs.append(_df)
+                df = pd.concat(dfs)
+                df.index = hashes
             else:
-                getter = eval_term(term)
-            replacements[field.name] = getter
-        config = replace(config, **replacements)
-        self.log.detailed(f"Built {config=} from {spec=}")
-        return config
+                df = pd.DataFrame(index=hashes)
+            df = df.reset_index().rename(columns={'index': 'hash'})
+        return df
 
-    def leave_breadcrumbs_at_path(self, path):
-        fs, _ = fsspec.url_to_fs(path)
-        with fs.open(path, "w") as f:
-            f.write("")
+    @staticmethod
+    def Kwargs(cls, root):
+        cls = eval_term(cls)
+        if root is None:
+            root = os.environ.get('DBXROOT')
+        kwargsanchorpath = cls._kwargsanchorpath(root)
+        fs, _ = fsspec.url_to_fs(kwargsanchorpath)
+        if not fs.exists(kwargsanchorpath):
+            df = None
+        else:
+            paths = list(fs.ls(kwargsanchorpath))
+            kwargsfiles_ = list(itertools.chain.from_iterable(
+                fs.ls(path) for path in paths
+            ))
+            kwargsfiles = [f for f in kwargsfiles_ if fs.exists(f) and f.endswith('.parquet')]
+            hashes = [os.path.dirname(f).removeprefix(kwargsanchorpath).removeprefix('/') for f in kwargsfiles]
+            if len(kwargsfiles) > 0:
+                dfs = []
+                for kwargsfile in kwargsfiles:
+                    _df = pd.read_parquet(kwargsfile)
+                    dfs.append(_df)
+                df = pd.concat(dfs)
+                df.index = hashes
+            else:
+                df = pd.DataFrame(index=hashes)
+            df = df.reset_index().rename(columns={'index': 'hash'})
+        return df
 
+    @staticmethod
+    def Journal(cls, entry: int = None, *, root=None):
+        if root is None:
+            root = os.environ.get('DBXROOT')
+        journaldirpath = Datablock._journalanchorpath(eval_term(cls), root)
+        fs, _ = fsspec.url_to_fs(journaldirpath)
+        files = list(fs.ls(journaldirpath))
+        parquet_files = [f for f in files if f.endswith('.parquet')]
+
+        log = Logger()
+        log.debug(f"READING JOURNAL: from {journaldirpath=}, files: {parquet_files}")
+        if len(parquet_files) > 0:
+            dfs = []
+            for file in parquet_files:
+                _df = pd.read_parquet(file)
+                if 'revision' not in _df.columns:
+                    _df = _df.rename(columns={'version': 'revision',})
+                dfs.append(_df)
+            df = pd.concat(dfs)
+            # TODO: FIX uuid; currently not unique
+            columns = ['hash', 'datetime'] + [c for c in df.columns if c not in ('hash', 'datetime', 'event', 'uuid')] + ['event']
+            df = df.sort_values('datetime', ascending=False)[columns].reset_index(drop=True)
+            df = df.rename(columns={'build_log': 'log'})
+        else:
+            df = None
+        if entry is not None:
+            result = JournalEntry(df.loc[entry])
+        else:
+            result = df
+        return result
+
+    def scopes(self):
+        return self.Scopes(self.__class__, self.root)
+    
+    def kwargs(self):
+        return self.Kwargs(self.__class__, self.root)
+
+    def journal(self, entry: int = None):
+        return self.Journal(self.__class__, entry, root=self.root)
+    #JOURNAL: END
+    
 
 def quote(obj, *args, tag="$", **kwargs):
     log = Logger()
     if not callable(obj):
         assert len(args) == 0, f"Nonempty args for a noncallable obj: {args}"
         assert len(kwargs) == 0, f"Nonempty kwargs for a noncallable obj: {kwargs}"
-        if isinstance(obj, str) and (obj.startswith("@") or obj.startswith("#") or obj.startswith("$")):
-            quote = obj
+        if isinstance(obj, Datablock):
+            _quote = obj._quote_
         else:
-            quote = f"{tag}{repr(obj)}"
-        log.detailed(f"Quoted {obj=} to {repr(quote)}")
+            _quote = repr(obj)
+        log.detailed(f"===============> Quoted {obj=} to {repr(_quote)}")
     else:
         func = obj
-        argstrs = [repr(arg) for arg in args]
-        kwargstrs = [f"{k}={repr(v)}" for k, v in kwargs.items()]
+        argstrs = [quote(arg) for arg in args]
+        kwargstrs = [f"{k}={quote(v)}" for k, v in kwargs.items()]
         argkwargstr = ','.join(argstrs+kwargstrs)
-        quote = f"{tag}{func.__module__}.{func.__qualname__}({argkwargstr})"
-        log.detailed(f"Quoted {func=}, {args=}, {kwargs=} to {repr(quote)}")
-    return quote
+        _quote = f"{tag}{func.__module__}.{func.__qualname__}({argkwargstr})"
+        log.detailed(f"Quoted {func=}, {args=}, {kwargs=} to {repr(_quote)}")
+    return _quote
 
 
 class TorchMultithreadingDatablocksBuilder:
