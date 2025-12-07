@@ -661,6 +661,7 @@ class Datablock:
 
     def build(self, *args, **kwargs):
         if self.capture_output:
+            self.log.verbose(f"-------------------- Capturing stdout to {self._logpath()} ------------------")
             stdout = sys.stdout
             logpath = self._logpath()
             outfs, _ = fsspec.url_to_fs(logpath)
@@ -668,7 +669,7 @@ class Datablock:
             sys.stdout = Tee(stdout, captured_stdout_stream)
         try:
             if not self.valid():
-                self.__pre_build__(*args, **kwargs).__build__(*args, **kwargs).__post_build__(*args, **kwargs)
+                self.pre_build(*args, **kwargs).__build__(*args, **kwargs).post_build(*args, **kwargs)
             else:
                 self.log.verbose(f"Skipping existing datablock: {self.hashpath()}")
         finally:
@@ -677,7 +678,7 @@ class Datablock:
                 captured_stdout_stream.close()
         return self
 
-    def __pre_build__(self, *args, **kwargs):
+    def pre_build(self, *args, **kwargs):
         self._write_kwargs()#TODO: REFACTOR thru _write_journal_dict
         self._write_journal_dict('spec', self.spec)
         self._write_scope() #TODO: REFACTOR thru _write_journal_dict
@@ -687,13 +688,21 @@ class Datablock:
         self._write_str('repr', self.__repr__())
 
         self._write_journal_entry(event="build:start",)
+        self.__pre_build__()
         return self
 
-    def __build__(self, *args, **kwargs):
+    def post_build(self, *args, **kwargs):
+        self.__post_build__()
+        self._write_journal_entry(event="build:end",)
         return self
+    
+    def __pre_build__(self, *args, **kwargs):
+        ...
 
     def __post_build__(self, *args, **kwargs):
-        self._write_journal_entry(event="build:end",)
+        ...
+
+    def __build__(self, *args, **kwargs):
         return self
 
     def leave_breadcrumbs(self):
