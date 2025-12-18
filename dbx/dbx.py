@@ -17,7 +17,7 @@ import queue
 import sys
 import threading
 import traceback as tb
-from typing import Union, Optional, Sequence
+from typing import Union, Optional, Sequence, Callable
 import uuid
 import yaml
 
@@ -248,6 +248,8 @@ def get_named_const_and_cxt(name):
             modname = prefix + "." + modbit
         else:
             modname = modbit
+        #DEBUG
+        #breakpoint()
         mod = importlib.import_module(modname)
         prefix = modname
         cxt[modname] = mod
@@ -794,13 +796,11 @@ class Datablock:
         self._write_journal_entry(event="UNSAFE_clear")
         return self
     
-    def UNSAFE_copy_from(self, anchorpath, hash: str = None, *, overwrite: bool = False):
+    def UNSAFE_copy_from(self, anchorpath, *, overwrite: bool = False):
         if not overwrite:
             assert not self.valid(), f"Attempting to overwrite a valid Datablock {self}. Missing 'overwrite' argument?"
         fs, _ = fsspec.url_to_fs(anchorpath)
-        if hash is None:
-            hash = self.hash
-        hashpath = os.path.join(anchorpath, hash) 
+        hashpath = os.path.join(anchorpath, self.hash) 
         assert fs.isdir(hashpath), f"Nonexistent hashpath {hashpath}"
         self.log.verbose(f"Copying files from {hashpath}: BEGIN")
         if self.has_topics():
@@ -1694,7 +1694,7 @@ class TorchMultiprocessingDatablocksBuilder(TorchMultithreadingDatablocksBuilder
                 block.to(device).build(*device_ctx_args, **device_ctx_kwargs).to('cpu')
             except Exception as e:
                 exception = e
-                self.log.info(f"ERROR building feature block {block} on process: {process}, device: {device}")
+                self.log.info(f"ERROR building datablock {block} on process: {process}, device: {device}")
             finally:
                 del block
                 gc.collect()
@@ -1706,12 +1706,87 @@ class TorchMultiprocessingDatablocksBuilder(TorchMultithreadingDatablocksBuilder
         del device_ctx_args, device_ctx_kwargs
         gc.collect()
         if exception is None:
-            self.log.debug(f"Done building {len(blocks)} feature blocks on process: {process}, device: {device}")
+            self.log.debug(f"Done building {len(blocks)} datablocks on process: {process}, device: {device}")
         else:
-            self.log.debug(f"Abandoning building {len(blocks)} feature blocks on process: {process}, device: {device} due to an exception")
+            self.log.debug(f"Abandoning building {len(blocks)} datablocks on process: {process}, device: {device} due to an exception")
         self.log.debug(f"Waiting on the done_queue on process: {process}, device: {device}")
         while True:
             item = done_queue.get()
             if item is None:
                 self.log.debug(f"Done message received on the done_queue on process: {process}, device: {device}")
                 break
+
+
+class MultithreadingCallableExecutor:
+    def __init__(self, *, n_threads, log: Logger = Logger()):
+        self.n_threads = n_threads
+        self.log = log
+
+    def exec_callables(self, callables: Sequence[Callable], *ctx_args, **ctx_kwargs):
+        if len(callables) > 0:
+            result_queue = queue.Queue()
+            done_queue = queue.Queue()
+            abort_event = threading.Event()
+            progress_bar = tqdm.tqdm(total=len(callables))
+            callable_lists = np.array_split(callables, self.n_threads)
+            callable_offsets = np.cumsum([0] + [len(callable_list) for callable_list in callable_lists])
+            threads = [
+                threading.Thread(target=self.__exec_callables__, args=(callable_list, ctx_args, ctx_kwargs, callable_offset, thread_idx, result_queue, done_queue, abort_event))
+                for thread_idx, (callable_list, callable_offset) in enumerate(zip(callable_lists, callable_offsets))
+            ]
+            payloads = []
+            done_idxs = []
+            for thread in threads:
+                thread.start()
+            while len(done_idxs) < len(callables):
+                success, thread_idx, callable_idx, payload = result_queue.get()
+                if success:
+                    done_idxs.append(callable_idx)
+                    e = None
+                    payloads.append(payload)
+                else:
+                    e = payload
+                    self.log.info(f"Received error from callable with {callable_idx=} on thread {thread_idx}. Abandoning result_queue polling.")
+                    break
+                progress_bar.update(1)
+            self.log.debug(f"Production loop done, feeding done_queue")
+            for _ in range(self.n_threads):
+                done_queue.put(None)
+            self.log.debug(f"Joining threads")
+            for thread in threads:
+                thread.join()
+            if e is not None:
+                self.log.verbose("Raising exception")
+                raise e
+            self.log.debug("Threads successfully joined")
+        return payloads
+    
+    def __exec_callables__(self, callables: Sequence[Callable], ctx_args, ctx_kwargs, offset: int, thread_idx: int, result_queue: queue.Queue, done_queue: queue.Queue, abort_event: threading.Event):
+        self.log.debug(f"Executing {len(callables)} callables on thread: {thread_idx}")
+        for i, callable in enumerate(callables):
+            self.log.detailed(f"EXECUTING callable {i+offset} on {thread_idx=}: {callable}")
+            exception = None
+            try:
+                if abort_event.is_set():
+                    break
+                payload = callable(*ctx_args, **ctx_kwargs)
+                self.log.detailed(f"EXECUTED callable {i+offset}: result: {payload}")
+            except Exception as e:
+                exception = e
+                self.log.info(f"ERROR executing callable {callable} on {thread_idx=}")
+            if exception is not None:
+                result_queue.put((False, thread_idx, offset+i, exception))
+                break
+            result_queue.put((True, thread_idx, offset+i, payload))
+        gc.collect()
+        if exception is None:
+            self.log.debug(f"Done executing {len(callables)} callables on {thread_idx=}")
+        else:
+            self.log.debug(f"Abandoning executing {len(callables)} callables on {thread_idx=} due to an exception")
+        self.log.debug(f"Waiting on the done_queue on {thread_idx}")
+        while True:
+            item = done_queue.get()
+            if item is None:
+                self.log.debug(f"Done message received on the done_queue on {thread_idx=}")
+                break
+    
