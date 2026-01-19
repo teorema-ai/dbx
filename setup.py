@@ -26,7 +26,8 @@ setuptools.setup(
     ],
     entry_points={'console_scripts': [
         'dbx=dbx:exec',
-        'dbx.print=dbx:exec_print',
+        'dbx.print=dbx:pprint',
+        'dbx.pprint=dbx:pprint',
     ]},
     python_requires='>=3.7', 
     install_requires=get_requirements(),
