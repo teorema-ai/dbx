@@ -1195,9 +1195,6 @@ class Datablock:
     
     @property
     def revision(self):
-        #DEBUG
-        breakpoint()
-
         if not hasattr(self, '_revision'):
             self.log.selected(f"--------------> COMPUTING revision")
             if self._revision_ is None:
