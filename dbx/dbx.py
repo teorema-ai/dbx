@@ -219,9 +219,13 @@ class JournalEntry(pd.Series):
         return r
     
     def instantiate(self, gitrepo=None, revision=None):
-        return self.eval('eval', eval_term=True, gitrepo=gitrepo, revision=revision)
+        if revision == 'self':
+            revision = self.revision
+        if gitrepo == 'self':
+            gitrepo = self.gitrepo
+        return self.eval('quote', eval_term=True, gitrepo=gitrepo, revision=revision)
 
-    def inst(self, gitrepo=None, revision=None):
+    def inst(self, gitrepo='self', revision='self'):
         return self.instantiate(gitrepo=gitrepo, revision=revision)
     
 
@@ -764,7 +768,9 @@ class Datablock:
         return result
 
     def validpath(self, path):
-        if isinstance(path, dict):
+        if path is None:
+            return True
+        elif isinstance(path, dict):
             return all([self.validpath(p) for p in path.values()])
         elif isinstance(path, list):
             return all([self.validpath(p) for p in path])
@@ -844,6 +850,9 @@ class Datablock:
         return self
 
     def __pre_build__(self, *args, **kwargs):
+        valid_cfg = self.valid_cfg()
+        if not all(list(valid_cfg.values())):
+            raise ValueError(f"Not all upstream Datablocks in cfg are valid: {valid_cfg=}")
         self._write_journal_dict('spec', self.spec)
         self._write_journal_dict('kwargs', self.kwargs)
         self._write_str('quote', self.quote())
@@ -878,6 +887,17 @@ class Datablock:
                 c.build_tree(*args, **kwargs)   
                 self.log.verbose(f"------------------------ BUILDING SUBTREE at {s}: END --------------------------------")
         return self.build(*args, **kwargs)
+    
+    def valid_cfg(self, *, reduce=False):
+        results = {}
+        for s in self.spec.keys():
+            c = getattr(self.cfg, s)
+            if isinstance(c, Datablock):
+                results[s] = c.valid()
+        if reduce:
+            return all(list(results.values()))
+        else:
+            return results
     
     def read(self, topic=None):
         if self.has_topics():
@@ -1316,16 +1336,20 @@ class Datablock:
                 if isinstance(value, Datablock):
                     _spec[k] = value.handle()
                 elif self.is_specline(v):
-                    _spec[k] = repr(v)
+                    _spec[k] = v
+                elif isinstance(value, str):
+                    _spec[k] = value
                 else:
                     _spec[k] = repr(value)
         elif expansion == 'quote':
             for k, v in self.spec.items():
                 value = getattr(self.cfg, k)
                 if self.is_specline(v):
-                    _spec[k] = repr(v)
+                    _spec[k] = v
                 elif isinstance(value, Datablock):
                     _spec[k] = value.quote()
+                elif isinstance(value, str):
+                    _spec[k] = value
                 else:
                     _spec[k] = repr(value)
         else:
