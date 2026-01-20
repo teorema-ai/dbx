@@ -6,15 +6,16 @@ import functools
 import gc
 import hashlib
 import importlib
-import inspect
 import itertools
 import json
 import multiprocessing as mp
 import os
+from pathlib import Path
 import pickle
 import pprint as _pprint_
 import queue
 import sys
+import tempfile
 import threading
 import traceback as tb
 from typing import Union, Optional, Sequence, Callable
@@ -37,8 +38,11 @@ import torch
 import torch.multiprocessing as mp
 
 
+__eval__ = __builtins__['eval']
+
+
 def journal(cls, root=None):
-    return eval_term(cls).Journal(root)
+    return Datablock.Journal(cls, root)
 
 
 class Logger:
@@ -57,12 +61,12 @@ class Logger:
         datetime: bool = True,
         stack_depth: int = 2,
     ):
-        self._warning_ = eval(os.environ.get('DBXLOGWARNING', str(warning)))
-        self._info_ = eval(os.environ.get('DBXLOGINFO', str(info)))
-        self._verbose_ = eval(os.environ.get('DBXLOGVERBOSE', str(verbose)))
-        self._selected_ = eval(os.environ.get('DBXLOGSELECTED', str(selected)))
-        self._debug_ = eval(os.environ.get('DBXLOGDEBUG', str(debug)))
-        self._detailed_ = eval(os.environ.get('DBXLOGDETAILED', str(detailed)))
+        self._warning_ = __eval__(os.environ.get('DBXLOGWARNING', str(warning)))
+        self._info_ = __eval__(os.environ.get('DBXLOGINFO', str(info)))
+        self._verbose_ = __eval__(os.environ.get('DBXLOGVERBOSE', str(verbose)))
+        self._selected_ = __eval__(os.environ.get('DBXLOGSELECTED', str(selected)))
+        self._debug_ = __eval__(os.environ.get('DBXLOGDEBUG', str(debug)))
+        self._detailed_ = __eval__(os.environ.get('DBXLOGDETAILED', str(detailed)))
         
         self.allowed = ["ERROR"]
         if self._warning_:
@@ -187,25 +191,46 @@ class JournalEntry(pd.Series):
                 result = result.replace('\\', '')
         return result
     
-    def eval(self, thing, *, debug: bool = False, context={}, revision=None):
-        _eval_ = globals()['eval']
+    def eval(self, thing, *, debug: bool = False, context={}, eval_term: bool = False, deslash: bool = False, gitrepo=None, revision=None):
         exc = None
         thingstr = self.read(thing, raw=True)
+        if deslash:
+            thingstr = thingstr.replace('\\', '')
         r = None
+        if revision is not None:
+            if gitrepo is None:
+                gitrepo = self.gitrepo    
+            tempdir = gitpackage(gitrepo, revision=revision)
+        else:
+            tempdir = None
         try:
-            r = _eval_(thingstr, globals(), context)
-        except Exception as e:
+            if eval_term:
+                __eval_term__ = globals()['eval_term']
+                r = __eval_term__(thingstr)
+            else:
+                r = __eval__(thingstr, globals(), context)
+            if isinstance(r, Datablock) and tempdir is not None:
+                r = r.set(tempdir=tempdir)
+        except Exception as exc:
             if debug:
-                exc = e
                 breakpoint()
             else:
                 raise exc
         return r
     
+    def instantiate(self, gitrepo=None, revision=None):
+        return self.eval('eval', eval_term=True, gitrepo=gitrepo, revision=revision)
+
+    def inst(self, gitrepo=None, revision=None):
+        return self.instantiate(gitrepo=gitrepo, revision=revision)
+    
 
 class JournalFrame(pd.DataFrame):
     def __init__(self, df: pd.DataFrame):
         super().__init__(df)
+
+    def __call__(self, entry:int ):
+        return JournalEntry(self.loc[entry].dropna())
 
     def list(self, thing, *, take: str = 'last', sortby: Optional[str] = None, raw: bool = False):
         if take == 'last':
@@ -240,12 +265,33 @@ def gitrevision(repopath, *, log=Logger()):
         if repo.is_dirty():
             raise ValueError(f"Dirty git repo: {repopath}: commit your changes")
         branch = repo.active_branch.name
-        reponame = os.path.basename(repopath)
-        revision = f"{reponame}:{repo.rev_parse(branch).hexsha}"
-        log.selected(f"Obtained git revision for git repo {repopath}: {revision}")
+        revision = f"{repo.rev_parse(branch).hexsha}"
+        log.detailed(f"Obtained git revision for git repo {repopath}: {revision}")
     else:
         revision = None
     return revision
+
+
+def gitclone(repopath, newpath):
+    git.Repo.clone_from(repopath, newpath)
+    return newpath
+
+
+def gitcheckout(repopath, revision):
+    repo = git.Repo(repopath)
+    repo.git.checkout(revision)
+    return repopath
+
+
+def gitpackage(repopath, *, revision):
+    tempdir = tempfile.TemporaryDirectory()
+    package = os.path.basename(repopath)
+    pkgpath = os.path.join(tempdir.name, package)
+    _pkgpath = gitclone(repopath, pkgpath)
+    assert pkgpath == _pkgpath
+    gitcheckout(pkgpath, revision)
+    sys.path.insert(0, pkgpath)
+    return tempdir
 
 
 def make_google_cloud_storage_download_url(path):
@@ -282,10 +328,10 @@ def eval_term(name):
             for bit in bits:
                 if "=" in bit:
                     k, v = bit.split("=")
-                    val = eval(v)
+                    val = __eval__(v)
                     kwargs[k] = val
                 else:
-                    arg = eval(bit)
+                    arg = __eval__(bit)
                     args.append(arg)
         return args, kwargs
 
@@ -312,7 +358,7 @@ def eval_term(name):
                 term, _ = get_named_const_and_cxt(_name_)
             else:
                 _, cxt = get_named_const_and_cxt(funcstr)
-                term = eval(_name_, cxt)
+                term = __eval__(_name_, cxt)
         else:
             term = name
     else:
@@ -330,12 +376,16 @@ def exec(s=None):
     lb = s.find("(")
     lb = lb if lb != -1 else len(s)
     _, cxt = get_named_const_and_cxt(s[:lb])
-    r = eval(s, globals(), cxt)
+    r = __eval__(s, globals(), cxt)
     return r
 
 
 def pprint(argstr=None):
     _pprint_.pprint(exec(argstr))
+
+
+def eval(s=None):
+    return exec(s)
 
 
 def write_str(text, path, *, log=Logger(), debug: bool = False):
@@ -514,7 +564,8 @@ class Datablock:
         spec: dict
         quote: str
         repr: str
-        hashhandle: str
+        handle: str
+        hashstr: str
 
         def deslash(self, attr):
             a = getattr(self, attr)
@@ -556,6 +607,7 @@ class Datablock:
         capture_output: bool = False,
         revision: str = None,
         gitrepo: str  = None,
+        tempdir = None,
         device: str = 'cpu',
         **kwargs,
     ):
@@ -572,6 +624,7 @@ class Datablock:
             capture_output=capture_output,
             revision=revision,
             gitrepo=gitrepo,
+            tempdir=tempdir,
             device=device,
             **kwargs,
         )
@@ -591,12 +644,14 @@ class Datablock:
         capture_output: bool = False,
         revision: str = None,
         gitrepo: str  = None,
+        tempdir = None,
         device: str = 'cpu',
         **kwargs,
     ):
         """NB: signature must match __init__'s"""
         self._root_ = root
-        if self._root_ is None:
+        self.root = self._root_
+        if self.root is None:
             self.root = os.environ.get('DBXROOT')
         if self.root is None:
             raise ValueError(f"None root for {self.__class__.__name__}: maybe set DBXROOT?")
@@ -618,6 +673,7 @@ class Datablock:
         )
         self._revision_ = revision
         self.gitrepo = os.environ.get('DBXREPO', gitrepo)
+        self.tempdir = tempdir
         self.capture_output = bool(capture_output)
         self.device = device  
         #
@@ -677,7 +733,8 @@ class Datablock:
             kwargs=self.kwargs,
             quote=self.quote(),
             repr=self.__repr__(),
-            hashhandle=self.hashhandle,
+            handle=self.handle(),
+            hashstr=self.hashstr,
         )
     
     def validtopic(self, topic=None):
@@ -688,11 +745,23 @@ class Datablock:
         self.log.detailed(f"{self.anchor}: topic {topic} valid: {valid}")
         return valid
     
-    def validtopics(self, topics):
-        results = [
-            self.validtopic(topic) for topic in topics
-        ]
-        return all(results)
+    def validtopics(self, topics=None, *, reduce: bool = False):
+        result = None
+        if topics is None:
+            if not self.has_topics():
+                result = self.validtopic()
+            else:
+                topics = self.topics()
+        if result is None:
+            results = {
+                topic:
+                self.validtopic(topic) for topic in topics
+            }
+            if reduce:
+                result = all(list(results.values()))
+            else:
+                result = results
+        return result
 
     def validpath(self, path):
         if isinstance(path, dict):
@@ -712,24 +781,30 @@ class Datablock:
         self.log.detailed(f"{self.anchor}: path {path} valid: {result}") 
         return result
     
-    def validpaths(self,):
-        results = {}
-        if hasattr(self, "TOPICFILES"):
-            for topic in self.TOPICFILES:
-                results[topic] = self.validpath(self.path(topic))
-        else:
-            results += [self.validpath(self.path())]
-        return results
+    def validpaths(self, topics=None, *, reduce: bool = False):
+        result = None
+        if topics is None:
+            if not self.has_topics():
+                results = [self.validpath(self.path())]
+                if reduce:
+                    result = all(results)
+                else:
+                    result = results
+            else:
+                topics = self.topics()
+        if result is None:
+            results = {
+                topic: self.validpath(self.path(topic))
+                for topic in topics
+            }
+            if reduce:
+                result = all(list(results.values()))
+            else:
+                result = results
+        return result
     
     def valid(self,):
-        validpaths = self.validpaths()
-        if hasattr(self, "TOPICFILES"):
-            results = validpaths.values()
-        else:
-            results = validpaths
-        result = all(results)
-        self.log.detailed(f"{self.anchor}: {results=}")
-        return result
+        return self.validpaths(reduce=True)
     
     def topics(self):
         return list(self.TOPICFILES.keys()) if self.has_topics() else []
@@ -773,7 +848,8 @@ class Datablock:
         self._write_journal_dict('kwargs', self.kwargs)
         self._write_str('quote', self.quote())
         self._write_str('repr', self.__repr__())
-        self._write_str('hashhandle', self.hashhandle)
+        self._write_str('handle', self.handle())
+        self._write_str('hashstr', self.hashstr)
         self._write_journal_entry(event="build:start",)
         return self
 
@@ -798,8 +874,9 @@ class Datablock:
         for s in self.spec.keys():
             c = getattr(self.cfg, s)
             if isinstance(c, Datablock):
-                self.log.verbose(f"------------------------ Building subtree at {s} --------------------------------")
+                self.log.verbose(f"------------------------ BUILDING SUBTREE at {s}: BEGIN --------------------------------")
                 c.build_tree(*args, **kwargs)   
+                self.log.verbose(f"------------------------ BUILDING SUBTREE at {s}: END --------------------------------")
         return self.build(*args, **kwargs)
     
     def read(self, topic=None):
@@ -1196,34 +1273,35 @@ class Datablock:
     @property
     def revision(self):
         if not hasattr(self, '_revision'):
-            self.log.selected(f"--------------> COMPUTING revision")
+            self.log.detailed(f"--------------> COMPUTING revision")
             if self._revision_ is None:
-                self.log.selected(f"--------------> self._revision_ is None")
+                self.log.detailed(f"--------------> self._revision_ is None")
                 self._revision = gitrevision(self.gitrepo, log=self.log) if self.gitrepo is not None else None
-                self.log.selected(f"--------------> self._revision_: from gitrevision({self.gitrepo}")
+                self.log.detailed(f"--------------> self._revision_: from gitrevision({self.gitrepo}")
             else:
-                self.log.selected(f"--------------> Using {self._revision_=}")
+                self.log.detailed(f"--------------> Using {self._revision_=}")
                 self._revision = self._revision_
         return self._revision
 
     def __expand_spec__(self, expansion='repr'):
         """
-            . expansion: 'repr'|'quote'
-            . spec lines
-                . a specline is a str starting with '@', '$' or '#'
-                . a strline: a non-specline str
-                . an objline: a non-str object
+            . expansion: 'repr'|'quote'|'handle'
+                . specline:      str starting with '@', '$' or '#'
+                . datablock: Datablock object
+                . obj:       object
             'repr':
                 . FULL reduction
-                    |specline: repr(eval_term(specline)) -- repr-reduction
-                    |strline:  strline
-                    |objline:  repr(objline)
+                    |obj:    repr(obj)
+            'handle':
+                . DATABLOCK reduction
+                    |datablock: datablock.handle()
+                    |specline:      repr(specline)
+                    |obj:       repr(obj)
             'quote':
                 . UNREDUCED spec:
-                    |specline: specline
-                    |strline: strline
-                    |Datablock objline: objline.quote()
-                    |non-Datablock objline: repr(objline)  
+                    |specline:      repr(specline)
+                    |datablock: datablock.quote()
+                    |obj:       repr(obj)  
         """
         _spec = {}
         if expansion == 'repr':
@@ -1231,24 +1309,27 @@ class Datablock:
             # computed using the older version of these methods
             for k, v in self.spec.items():
                 value = getattr(self.cfg, k)
-                if isinstance(v, str):
-                    if self.is_specline(v):
-                        _spec[k] = repr(value)
-                    else: 
-                        _spec[k] = v
-                else:
+                _spec[k] = repr(value)
+        elif expansion == 'handle':
+            for k, v in self.spec.items():
+                value = getattr(self.cfg, k)
+                if isinstance(value, Datablock):
+                    _spec[k] = value.handle()
+                elif self.is_specline(v):
                     _spec[k] = repr(v)
+                else:
+                    _spec[k] = repr(value)
         elif expansion == 'quote':
             for k, v in self.spec.items():
                 value = getattr(self.cfg, k)
-                if isinstance(value, str):
-                    _spec[k] = v
+                if self.is_specline(v):
+                    _spec[k] = repr(v)
                 elif isinstance(value, Datablock):
                     _spec[k] = value.quote()
                 else:
                     _spec[k] = repr(value)
         else:
-            raise ValueError(f"Unknown expansion: {expansion}")
+            raise ValueError(f"Unknown expansion: {repr(expansion)}")
         return _spec
     
     @functools.cached_property
@@ -1276,30 +1357,47 @@ class Datablock:
         def cite(x):
             return repr(x) if isinstance(x, str) else x
 
-        kwargstrs = [f"{k}={cite(v)}" for k, v in kwargs.items()]
+        kwargstrs = [f"{k}={v}" for k, v in kwargs.items()]
         kwargsrepr = ', '.join(kwargstrs)
         return f"{self.anchor}({kwargsrepr})"
     
-    def quote(self):
-        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
-        # computed using the older version of these methods
-        expanded_spec = self.__expand_spec__('full')
+    def quote(self, *, deslash: bool = False):
+        quoted_spec = self.__expand_spec__('quote')
         quote = "$" + self.__repr_from_kwargs__({
-            **{'spec': expanded_spec},
+            **self._rootkwargs_,
+            **{'spec': quoted_spec},
         })
-        self.log.detailed(f"quote: ------------> {expanded_spec=}")
+        if deslash:
+            quote = quote.replace('\\', '')
+        self.log.detailed(f"quote: ------------> {quoted_spec=}")
         self.log.detailed(f"quote: ------------> {quote=}")
         return quote
+
+    def handle(self, *, deslash: bool = False):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
+        # computed using the older version of these methods
+        repr_spec = self.__expand_spec__('handle')
+        handle = self.__repr_from_kwargs__({
+            **self._rootkwargs_,
+            **{'spec': repr_spec},
+        })
+        if deslash:
+            handle = handle.replace('\\', '')
+        self.log.detailed(f"handle: ------------> {repr_spec=}")
+        self.log.detailed(f"handle: ------------>{handle=}")
+        return handle
     
-    def __repr__(self):
-        expanded_spec = self.__expand_spec__('repr')
+    def __repr__(self, *, deslash: bool = False):
+        repr_spec = self.__expand_spec__('repr')
         r = self.__repr_from_kwargs__({
             **self._rootkwargs_,
-            **{'spec': expanded_spec},
+            **{'spec': repr_spec},
             **self._tailkwargs_,
         })
-        self.log.detailed(f"__repr__(): ------------> {expanded_spec=}")
+        self.log.detailed(f"__repr__(): ------------> {repr_spec=}")
         self.log.detailed(f"__repr__(): ------------> __repr__={r}")
+        if deslash:
+            r = r.replace('\\', '')
         return r
     
     def __str__(self):
@@ -1312,19 +1410,19 @@ class Datablock:
         return self.__getstate__()
     
     @property
-    def hashhandle(self):
+    def hashstr(self):
         #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
         # computed using the older version of these methods
         if hasattr(self, "TOPICFILES"):
             topics = [f"topic:{topic}={file}" for topic, file in self.TOPICFILES.items()]
         else:
             topics = ["topics:None"]
-        hashhandle = os.path.join(
-            self.__repr__(),
+        hashstr = os.path.join(
+            self.handle(),
             f"version={self.version}",
             *topics,
         )
-        return hashhandle
+        return hashstr
     
     @property
     def hash(self): 
@@ -1335,9 +1433,9 @@ class Datablock:
                 self._hash = self._hash_
             else:
                 sha = hashlib.sha256()
-                sha.update(self.hashhandle.encode())
+                sha.update(self.hashstr.encode())
                 self._hash = sha.hexdigest()
-                self.log.detailed(f"hash: ---------===---------> {self.hashhandle=} ---> hash: {self._hash}")
+                self.log.detailed(f"hash: ---------===---------> {self.hashstr=} ---> hash: {self._hash}")
         return self._hash
     #IDENTIFICATION: END
 
@@ -1377,8 +1475,9 @@ class Datablock:
         spec_path = self._xpath('spec', 'yaml')
         kwargs_path = self._xpath('kwargs', 'yaml')
         quote_path = self._xpath('quote', 'txt')
-        hashhandle_path = self._xpath('hashhandle', 'txt')
+        handle_path = self._xpath('quote', 'txt')
         repr_path = self._xpath('repr', 'txt')
+        hashstr_path = self._xpath('hashstr', 'txt')
         #
         logpath = self._logpath()
         if logpath is not None:
@@ -1401,8 +1500,10 @@ class Datablock:
                                          'spec': spec_path,
                                          'kwargs': kwargs_path,
                                          'quote': quote_path,
+                                         'handle': handle_path,
                                          'repr': repr_path,
-                                         'hashhandle': hashhandle_path,
+                                         'hashstr': hashstr_path,
+                                         'gitrepo': self.gitrepo,
         }])
         df.to_parquet(journal_path)
         
@@ -1468,7 +1569,7 @@ class Datablock:
             df = df.reset_index().rename(columns={'index': 'hash'})
         return df
 
-    @classmethod
+    @staticmethod
     def Journal(cls, entry: int = None, *, root=None):
         if root is None:
             root = os.environ.get('DBXROOT')
@@ -1494,7 +1595,7 @@ class Datablock:
         else:
             df = None
         if entry is not None:
-            result = JournalEntry(df.loc[entry])
+            result = JournalEntry(df.loc[entry].dropna())
         else:
             result = JournalFrame(df)
         return result
@@ -1510,7 +1611,7 @@ def quote(obj, *args, tag="$", **kwargs):
         assert len(args) == 0, f"Nonempty args for a noncallable obj: {args}"
         assert len(kwargs) == 0, f"Nonempty kwargs for a noncallable obj: {kwargs}"
         if isinstance(obj, Datablock):
-            _quote = obj.beta
+            _quote = obj.quote()
         else:
             _quote = repr(obj)
         log.detailed(f"===============> Quoted {obj=} to {repr(_quote)}")

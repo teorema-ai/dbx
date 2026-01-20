@@ -16,7 +16,7 @@ def get_requirements():
 
 setuptools.setup(
     name="dbx",
-    version="0.0.2",
+    version="0.0.3",
     author="Dmitry Karpeyev",
     author_email="dmitry.karpeyev@gmail.com",
     description="Data experiment management hub",
@@ -26,6 +26,8 @@ setuptools.setup(
     ],
     entry_points={'console_scripts': [
         'dbx=dbx:exec',
+        'dbx.exec=dbx:exec',
+        'dbx.eval=dbx:eval',
         'dbx.print=dbx:pprint',
         'dbx.pprint=dbx:pprint',
     ]},
