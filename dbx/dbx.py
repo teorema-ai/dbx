@@ -708,12 +708,12 @@ class Datablock:
         for k, v in kwargs.items():
             setattr(self, k, v)
             
-        handled_keys = set(self._explicit_params_) | {'kwargs'}
+        handled_keys = set(self.__explicit_params__()) | {'kwargs'}
         other_keys = [k for k in state if k not in handled_keys]
         assert len(other_keys) == 0, f"Unknown keys in state: {other_keys}"
             
         # self.parameters used for state retrieval
-        self.parameters = self._explicit_params_ + list(kwargs_dict.keys())
+        self.parameters = self.__explicit_params__() + list(kwargs.keys())
         
         self.dt = datetime.datetime.now().isoformat().replace(' ', '-').replace(':', '-')
         self.build_dt = None
@@ -732,7 +732,7 @@ class Datablock:
 
     def __getstate__(self):
         _state = {}
-        for k in self._explicit_params_:
+        for k in self.__explicit_params__():
             if hasattr(self, f"_{k}_"):
                 _state[k] = getattr(self, f"_{k}_")
             elif hasattr(self, k):
@@ -740,14 +740,14 @@ class Datablock:
         
         _kwargs = {
             k: getattr(self, k)
-            for k in self.parameters if k not in explicit_params and hasattr(self, k)
+            for k in self.parameters if k not in self.__explicit_params__() and hasattr(self, k)
         }
         _state['kwargs'] = _kwargs
         return _state
 
-    @functools.cached_property
-    def _explicit_params_(self):
-        sig = inspect.signature(self.__init__)
+    @staticmethod
+    def __explicit_params__():
+        sig = inspect.signature(Datablock.__init__)
         return [
             p.name for p in sig.parameters.values()
             if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD) and p.name != 'self'
