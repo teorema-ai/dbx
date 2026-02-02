@@ -855,7 +855,7 @@ class Datablock:
         return self.validpaths(reduce=True)
     
     def topics(self):
-        return list(self.TOPICFILES.keys()) if self.has_topics() else []
+        return list(self.TOPICFILES.keys()) if self.has_topics() else ([] if self.has_topic() else None)
 
     def has_topics(self):
         return hasattr(self, "TOPICFILES")
@@ -1120,7 +1120,11 @@ class Datablock:
             + self.__class__.__name__
         )
         return anchor
-    
+
+    @property
+    def stump(self):
+        return self.__class__.__name__
+
     def anchorpath(self):
         anchorpath = os.path.join(
             self.root,
@@ -2206,6 +2210,8 @@ def remote(*, revision=None, env=None):
     Instantiate a remote dbx interpreter and return a Remote handle to it.
     """
     combined_env = {k: v for k, v in os.environ.items() if k.startswith('DBX')}
+    if DBXWRKREPO is not None:
+        combined_env['DBXGITREPO'] = DBXWRKREPO
     if env:
         combined_env.update(env)
     return Remote(env=combined_env, revision=revision)
@@ -2217,6 +2223,7 @@ class RemoteCallableExecutor:
         self.log = log
         self.workers = [remote(revision=revision, env=env) for _ in range(n_threads)]
 
+    #ALIAS
     def execute(self, callables: Sequence[Callable], *ctx_args, **ctx_kwargs):
         return self.exec_callables(callables, *ctx_args, **ctx_kwargs)
 
@@ -2269,9 +2276,9 @@ class RemoteCallableExecutor:
         return payloads
 
     def __exec_callables__(self, worker, callables: Sequence[Callable], ctx_args, ctx_kwargs, offset: int, thread_idx: int, result_queue: queue.Queue, done_queue: queue.Queue, abort_event: threading.Event):
-        self.log.debug(f"Executing {len(callables)} callables on thread: {thread_idx}")
+        self.log.debug(f"Executing {len(callables)} callables on worker {thread_idx}")
         for i, callable in enumerate(callables):
-            self.log.detailed(f"EXECUTING callable {i+offset} on {thread_idx=}: {callable}")
+            self.log.detailed(f"EXECUTING callable {i+offset} on worker {thread_idx}: {callable}")
             exception = None
             try:
                 if abort_event.is_set():
@@ -2280,7 +2287,7 @@ class RemoteCallableExecutor:
                 self.log.detailed(f"EXECUTED callable {i+offset}: result: {payload}")
             except Exception as e:
                 exception = e
-                self.log.info(f"ERROR executing callable {callable} on {thread_idx=}")
+                self.log.info(f"ERROR executing callable {callable} on worker {thread_idx}")
             
             if exception is not None:
                 result_queue.put((False, thread_idx, offset+i, exception))
@@ -2289,15 +2296,15 @@ class RemoteCallableExecutor:
         
         gc.collect()
         if exception is None:
-            self.log.debug(f"Done executing {len(callables)} callables on {thread_idx=}")
+            self.log.debug(f"Done executing {len(callables)} callables on worker {thread_idx}")
         else:
-            self.log.debug(f"Abandoning executing {len(callables)} callables on {thread_idx=} due to an exception")
+            self.log.debug(f"Abandoning executing {len(callables)} callables on worker {thread_idx} due to an exception")
         
-        self.log.debug(f"Waiting on the done_queue on {thread_idx}")
+        self.log.debug(f"Waiting on the done_queue on worker {thread_idx}")
         while True:
             item = done_queue.get()
             if item is None:
-                self.log.debug(f"Done message received on the done_queue on {thread_idx=}")
+                self.log.debug(f"Done message received on the done_queue on worker {thread_idx}")
                 break
 
 
