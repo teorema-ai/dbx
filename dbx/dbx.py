@@ -47,6 +47,32 @@ DBXGITREPO = os.environ.get('DBXGITREPO')
 DBXWRKREPO = None
 DBXWRKROOT = None
 
+def gitwrkreposetup(revision=None, *, reason: str = "", log=None):
+    if log is None:
+        log = Logger(name="gitwrkreposetup")
+    global DBXGITREPO
+    tbstr = ''.join(tb.format_stack())
+    log.silent(f"gitwrkreposetup callstack:\n{tbstr}")
+    global DBXWRKREPO
+    global DBXWRKROOT
+    use_dbxgitrepo = os.environ.get('DBXGITREPO') or revision is not None
+    if use_dbxgitrepo and DBXWRKREPO is None:
+        log.info(f"SETTING UP TEMPORARY DBXWRKROOT from {DBXGITREPO=} {reason}")
+        DBXWRKROOT = tempfile.TemporaryDirectory()
+        package = os.path.basename(DBXGITREPO)
+        globals()['DBXWRKREPO'] = os.path.join(DBXWRKROOT.name, package)
+        _pkgpath = gitclone(DBXGITREPO, globals()['DBXWRKREPO'])
+        assert globals()['DBXWRKREPO'] == _pkgpath
+        sys.path.insert(0, globals()['DBXWRKREPO'])
+        # ENSURE that any child process gets the same DBXGITREPO and does not spawn its own temporary repo
+        os.environ['DBXGITREPO'] = globals()['DBXWRKREPO']
+        if 'DBXWRKREPO' in os.environ:
+            del os.environ['DBXWRKREPO']
+        log.info(f"DBXWRKROOT: {DBXWRKROOT.name}, DBXWRKREPO: {globals()['DBXWRKREPO']}")
+        log.selected(f"os.environ['DBXGITREPO'] = {os.environ['DBXGITREPO']}, os.environ['DBXWRKREPO'] = {os.environ.get('DBXWRKREPO')}")
+    if revision is not None:
+        gitcheckout(globals()['DBXWRKREPO'], revision)
+
 
 def journal(cls, root=None):
     return Datablock.Journal(cls, root)
@@ -204,8 +230,8 @@ class JournalEntry(pd.Series):
         if deslash:
             thingstr = thingstr.replace('\\', '')
         r = None
-        if revision is not None: 
-            gitwrkreposetup(revision=revision)
+        # Call this here because a new revision may need to be checked out
+        gitwrkreposetup(revision=revision, reason=f"because of evaluating a JournalEntry field {thing}")
         try:
             if eval_term:
                 __eval_term__ = globals()['eval_term']
@@ -288,13 +314,14 @@ class JournalFrame(pd.DataFrame):
         return thingsframe
 
     
-def gitrevision(repopath, *, log=Logger()):
+def gitrevision(*, log=Logger()):
+    repopath = DBXWRKREPO if DBXWRKREPO is not None else DBXGITREPO
     if repopath is not None:
         repo = git.Repo(repopath)
         if repo.is_dirty():
-            raise ValueError(f"Dirty git repo: {repopath}: commit your changes")
+            raise ValueError(f"Dirty git repo: {repopath}: commit your changes: {DBXWRKREPO=}, {DBXGITREPO=}")
         revision = repo.head.commit.hexsha
-        log.detailed(f"Obtained git revision for git repo {repopath}: {revision}")
+        log.detailed(f"Obtained git revision for git repo {repopath}: {revision}, {DBXWRKREPO=}, {DBXGITREPO=}")
     else:
         revision = None
     return revision
@@ -311,25 +338,7 @@ def gitcheckout(repopath, revision):
     return repopath
 
 
-def gitwrkreposetup(revision=None):
-    global DBXGITREPO
-    global DBXWRKREPO
-    global DBXWRKROOT
-    if DBXWRKREPO is None:
-        repopath = DBXGITREPO
-        print(f"DBX: SETTING UP TEMPORARY DBXWRKROOT from {repopath=}")
-        DBXWRKROOT = tempfile.TemporaryDirectory()
-        package = os.path.basename(repopath)
-        DBXWRKREPO = os.path.join(DBXWRKROOT.name, package)
-        _pkgpath = gitclone(repopath, DBXWRKREPO)
-        assert DBXWRKREPO == _pkgpath
-        sys.path.insert(0, DBXWRKREPO)
-        print(f"DBX: DBXWRKROOT: {DBXWRKROOT.name}, DBXWRKREPO: {DBXWRKREPO}")
-
-    if revision is not None:
-        gitcheckout(DBXWRKREPO, revision)
-    
-    return DBXWRKREPO
+gitwrkreposetup(reason="for initial import of dbx")
 
 
 def make_google_cloud_storage_download_url(path):
@@ -405,9 +414,6 @@ def eval_term(name):
 
 
 def eval(s=None):
-    global DBXWRKREPO
-    if os.environ.get('DBXWRKREPO', False):
-        gitwrkreposetup()
     if s is None:
         if len(sys.argv) > 2:
             raise ValueError(f"Too many args: {sys.argv}")
@@ -600,6 +606,7 @@ class Datablock:
     @dataclass
     class Bid: #BlockId
         hash: str
+        key: str
         version: str
         revision: str
         kwargs: dict
@@ -608,6 +615,7 @@ class Datablock:
         repr: str
         handle: str
         hashstr: str
+        keystr: str
 
         def deslash(self, attr):
             a = getattr(self, attr)
@@ -773,6 +781,7 @@ class Datablock:
     def bid(self):
         return self.Bid(
             hash=self.hash,
+            key=self.key,   
             version=self.version,
             revision=self.revision,
             spec=self.spec,
@@ -781,6 +790,7 @@ class Datablock:
             repr=self.__repr__(),
             handle=self.handle(),
             hashstr=self.hashstr,
+            keystr=self.keystr,
         )
     
     def validtopic(self, topic=None):
@@ -919,9 +929,11 @@ class Datablock:
         for s in self.spec.keys():
             c = getattr(self.cfg, s)
             if isinstance(c, Datablock):
+                self._write_journal_entry(event=f"build_tree:{s}:begin")
                 self.log.verbose(f"------------------------ BUILDING SUBTREE at {s}: BEGIN --------------------------------")
                 c.build_tree(*args, **kwargs)   
                 self.log.verbose(f"------------------------ BUILDING SUBTREE at {s}: END --------------------------------")
+                self._write_journal_entry(event=f"build_tree:{s}:end")
         return self.build(*args, **kwargs)
     
     def valid_cfg(self, *, reduce=False):
@@ -1337,8 +1349,8 @@ class Datablock:
             if self._revision_ is None:
                 self.log.detailed(f"--------------> self._revision_ is None")
                 gitrepo = DBXWRKREPO if DBXWRKREPO is not None else DBXGITREPO
-                self._revision = gitrevision(gitrepo, log=self.log) if gitrepo is not None else None
-                self.log.detailed(f"--------------> self._revision_: from gitrevision({gitrepo}")
+                self._revision = gitrevision(log=self.log) if gitrepo is not None else None
+                self.log.detailed(f"--------------> self._revision_: from gitrevision()")
             else:
                 self.log.detailed(f"--------------> Using {self._revision_=}")
                 self._revision = self._revision_
@@ -1421,13 +1433,17 @@ class Datablock:
         self.log.detailed(f"{self.anchor}: _tailkwargs_: {tailkwargs=}")
         return tailkwargs
     
-    def __repr_from_kwargs__(self, kwargs):
+    def __repr_from_kwargs__(self, kwargs, *, use_stump: bool = False):
         def cite(x):
             return repr(x) if isinstance(x, str) else x
 
         kwargstrs = [f"{k}={v}" for k, v in kwargs.items()]
         kwargsrepr = ', '.join(kwargstrs)
-        return f"{self.anchor}({kwargsrepr})"
+        if use_stump:
+            _repr_ = f"{self.stump}({kwargsrepr})"
+        else:
+            _repr_ = f"{self.anchor}({kwargsrepr})"
+        return _repr_
     
     def quote(self, *, deslash: bool = False):
         quoted_spec = self.__expand_spec__('quote')
@@ -1454,6 +1470,18 @@ class Datablock:
         self.log.detailed(f"handle: ------------> {repr_spec=}")
         self.log.detailed(f"handle: ------------>{handle=}")
         return handle
+
+    def knob(self, *, deslash: bool = False):
+        repr_spec = self.__expand_spec__('handle')
+        knob = self.__repr_from_kwargs__({
+            **self._rootkwargs_,
+            **{'spec': repr_spec},
+        }, use_stump=True)
+        if deslash:
+            knob = knob.replace('\\', '')
+        self.log.detailed(f"knob: ------------> {repr_spec=}")
+        self.log.detailed(f"knob: ------------>{knob=}")
+        return knob
     
     def __repr__(self, *, deslash: bool = False):
         repr_spec = self.__expand_spec__('repr')
@@ -1491,6 +1519,21 @@ class Datablock:
             *topics,
         )
         return hashstr
+
+    @property
+    def keystr(self):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
+        # computed using the older version of these methods
+        if hasattr(self, "TOPICFILES"):
+            topics = [f"topic:{topic}={file}" for topic, file in self.TOPICFILES.items()]
+        else:
+            topics = ["topics:None"]
+        keystr = os.path.join(
+            self.knob(),
+            f"version={self.version}",
+            *topics,
+        )
+        return keystr
     
     @property
     def hash(self): 
@@ -1505,6 +1548,17 @@ class Datablock:
                 self._hash = sha.hexdigest()
                 self.log.detailed(f"hash: ---------===---------> {self.hashstr=} ---> hash: {self._hash}")
         return self._hash
+    
+    @property
+    def key(self):
+        #CAUTION! Changing this code may invalidate Datablocks that have already been computed and identified by their hashes
+        # computed with the older code.
+        if not hasattr(self, '_key'): 
+            sha = hashlib.sha256()
+            sha.update(self.keystr.encode())
+            self._key = sha.hexdigest()
+            self.log.detailed(f"key: ---------===---------> {self.keystr=} ---> key: {self._key}")
+        return self._key
     #IDENTIFICATION: END
 
     #JOURNAL: BEGIN
@@ -1518,14 +1572,14 @@ class Datablock:
         yfs, _ = fsspec.url_to_fs(ypath)
         write_yaml(data, ypath)
         assert yfs.exists(ypath), f"path {ypath} does not exist after writing"
-        self.log.debug(f"WROTE: {name.upper()}: yaml: {ypath}")
+        self.log.detailed(f"WROTE: {name.upper()}: yaml: {ypath}")
         #
         pqpath = self._xpath(name, 'parquet')
         pqfs, _ = fsspec.url_to_fs(pqpath)
         df = pd.DataFrame.from_records([{k: repr(v) for k, v in data.items()}])
         df.to_parquet(pqpath)
         assert pqfs.exists(pqpath), f"pqpath {pqpath} does not exist after writing"
-        self.log.debug(f"WROTE: {name.upper()}: parquet: {pqpath}")
+        self.log.detailed(f"WROTE: {name.upper()}: parquet: {pqpath}")
 
     def _write_str(self, name, text):
         #
@@ -1533,19 +1587,21 @@ class Datablock:
         fs, _ = fsspec.url_to_fs(path)
         write_str(text, path)
         assert fs.exists(path), f"scopepath {path} does not exist after writing"
-        self.log.debug(f"WROTE: {name.upper()}: txt: {path}")
+        self.log.detailed(f"WROTE: {name.upper()}: txt: {path}")
 
-    def _write_journal_entry(self, event:str):
+    def _write_journal_entry(self, event:str, *, annotation: str = None):
         self._write_journal_dict('spec', self.spec)
         self._write_journal_dict('kwargs', self.kwargs)
         self._write_str('quote', self.quote())
         self._write_str('repr', self.__repr__())
         self._write_str('handle', self.handle())
         self._write_str('hashstr', self.hashstr)
+        self._write_str('keystr', self.keystr)
+        if annotation is not None:
+            self._write_str('annotation', annotation)
         #
-        hash = self.hash
         dt = datetime.datetime.now().isoformat().replace(' ', '-').replace(':', '-')
-        key = f"{hash}-{dt}"
+        filename = f"{self.hash}-{dt}"
 
         spec_path = self._xpath('spec', 'yaml')
         kwargs_path = self._xpath('kwargs', 'yaml')
@@ -1553,6 +1609,11 @@ class Datablock:
         handle_path = self._xpath('quote', 'txt')
         repr_path = self._xpath('repr', 'txt')
         hashstr_path = self._xpath('hashstr', 'txt')
+        keystr_path = self._xpath('keystr', 'txt')
+        if annotation is not None:
+            annotation_path = self._xpath('annotation', 'txt')
+        else:
+            annotation_path = None
         #
         logpath = self._logpath()
         if logpath is not None:
@@ -1561,14 +1622,15 @@ class Datablock:
         else:
             has_log = False
         #
-        journal_path = os.path.join(self._journalanchorpath(self.__class__, self.root), f"{key}.parquet")
+        journal_path = os.path.join(self._journalanchorpath(self.__class__, self.root), f"{filename}.parquet")
         df = pd.DataFrame.from_records([{'datetime': dt,
                                          'build_datetime': self.build_dt,
                                          'version': self.version,
                                          'revision': self.revision, 
                                          'root': self.root,
                                          'anchor': self.anchor,
-                                         'hash': hash,
+                                         'hash': self.hash,
+                                         'key': self.key,
                                          'tag': self.tag, 
                                          'log': logpath if has_log else None,
                                          'event': event,
@@ -1578,6 +1640,8 @@ class Datablock:
                                          'handle': handle_path,
                                          'repr': repr_path,
                                          'hashstr': hashstr_path,
+                                         'keystr': keystr_path,
+                                         'annotation': annotation_path,
                                          'gitrepo': DBXGITREPO,
                                          'wrkrepo': DBXWRKREPO,
         }])
@@ -2088,7 +2152,7 @@ class Remote:
         Base class for remote proxies. Defined as a non-actor to support inheritance.
         """
         def __init__(self, obj):
-            self.obj = obj
+            self._obj = obj
 
         def _wrap(self, val):
             """
@@ -2131,7 +2195,7 @@ class Remote:
             if hasattr(self, name):
                 attr = getattr(self, name)
             else:
-                attr = getattr(self.obj, name)
+                attr = getattr(self._obj, name)
             is_call = callable(attr)
             return is_call, (None if is_call else self._wrap(attr))
 
@@ -2156,8 +2220,8 @@ class Remote:
             # We import the package to get the full namespace.
             import dbx
             
-            if revision:
-                dbx.gitwrkreposetup(revision)
+            # Call this here, because os.environ got updated and/or a new revision may need to be checked out
+            dbx.gitwrkreposetup(revision=revision, reason="because of RemoteDBX initialization")
                 
             super().__init__(dbx)
 
@@ -2205,7 +2269,7 @@ class Remote:
         return self._unwrap_or_proxy(res)
 
 
-def remote(*, revision=None, env=None):
+def remote(*, revision=None, env=None, log: Logger = Logger()):
     """
     Instantiate a remote dbx interpreter and return a Remote handle to it.
     """
@@ -2214,6 +2278,7 @@ def remote(*, revision=None, env=None):
         combined_env['DBXGITREPO'] = DBXWRKREPO
     if env:
         combined_env.update(env)
+    log.verbose(f"INSTANTIATING Remote with env: {combined_env}, revision: {revision}")
     return Remote(env=combined_env, revision=revision)
 
 
